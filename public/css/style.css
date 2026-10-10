@@ -141,7 +141,8 @@ html.light .grain { opacity: .5; }
   padding: 26px 40px;
 }
 .brand { display: inline-flex; align-items: center; gap: 12px; }
-.brand img { display: block; width: 30px; height: 30px; }
+/* logo 原始比例为 400:330（约 1.21:1），锁定高度、宽度自适应，避免被拉成方形 */
+.brand img { display: block; height: 30px; width: auto; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.25; }
 .brand-name { font-family: var(--font-serifcn); font-weight: 600; font-size: 17px; color: var(--fg); }
 .brand-mono { font-family: var(--font-mono); font-size: 10px; letter-spacing: .34em; color: var(--dim); }
