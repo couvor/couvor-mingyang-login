@@ -12,11 +12,26 @@ function buildTencent() {
   const smsTemplateId = (process.env.TENCENT_SMS_TEMPLATE_ID || '').trim();
   const sesFromAddress = (process.env.TENCENT_SES_FROM_ADDRESS || '').trim();
 
+  // 邮件通道二：SES 的 SMTP 发送（不需要 CAM 密钥，只需发信地址 + SMTP 密码）。
+  // 腾讯云 SES 控制台「发信地址」页可看到 SMTP 服务地址与端口，并单独设置 SMTP 密码。
+  //   SES_SMTP_HOST  默认 smtp.qcloudmail.com
+  //   SES_SMTP_PORT  465(SSL) / 587(STARTTLS) / 25，默认 465
+  //   SES_SMTP_USER  默认取发信地址
+  //   SES_SMTP_PASS  SMTP 密码（**机密**，只存 /etc/loginapp.env，绝不进代码或日志）
+  const smtpHost = (process.env.SES_SMTP_HOST || 'smtp.qcloudmail.com').trim();
+  const smtpPort = parseInt(process.env.SES_SMTP_PORT || '465', 10);
+  const smtpUser = (process.env.SES_SMTP_USER || sesFromAddress).trim();
+  // 密码不做 trim：首尾空格可能是密码的一部分
+  const smtpPass = process.env.SES_SMTP_PASS || '';
+  const smtpConfigured = !!smtpHost && !!smtpUser && !!smtpPass;
+
   const hasCredential = !!secretId && !!secretKey;
   // 短信要齐全（应用、签名、模板）才视为可用
   const smsConfigured = hasCredential && !!smsSdkAppId && !!smsSign && !!smsTemplateId;
   // 邮件只需发信地址（仍需在控制台完成验证/认证，否则 SendEmail 会报 NoSuchSender）
-  const sesConfigured = hasCredential && !!sesFromAddress;
+  const sesApiConfigured = hasCredential && !!sesFromAddress;
+  // 邮件整体可用 = SMTP 通道 或 API 通道 任一配齐（SMTP 优先）
+  const sesConfigured = smtpConfigured || sesApiConfigured;
 
   return {
     secretId,
@@ -30,6 +45,17 @@ function buildTencent() {
     },
     ses: {
       fromAddress: sesFromAddress,
+      fromName: (process.env.SES_FROM_NAME || '明旸信息').trim(),
+      mode: smtpConfigured ? 'smtp' : sesApiConfigured ? 'api' : null,
+      smtp: {
+        host: smtpHost,
+        port: Number.isFinite(smtpPort) ? smtpPort : 465,
+        // 465 走隐式 SSL；587 / 25 走 STARTTLS（nodemailer 会自动升级）
+        secure: (Number.isFinite(smtpPort) ? smtpPort : 465) === 465,
+        user: smtpUser,
+        pass: smtpPass,
+        configured: smtpConfigured,
+      },
       region: (process.env.TENCENT_SES_REGION || 'ap-hongkong').trim(),
       configured: sesConfigured,
     },
