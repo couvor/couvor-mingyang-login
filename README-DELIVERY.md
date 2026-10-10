@@ -70,10 +70,33 @@ systemctl restart loginapp         # 改配置后重启
 - **联动登出**：`GET /logout?next=<客户端地址>` 支持退出后回跳（白名单校验，当前仅允许
   `https://x.mingyanginfo.com`，防开放重定向）；学桥退出时会先跳这里销毁本站会话
 
-## 六、安全机制备忘
+## 六、二次验证（MFA）：TOTP / 邮箱 / 手机 三选一（2026-10-10）
 
-- 密码 bcrypt(cost 12)；登录/2FA 同 IP+账号 5 次失败锁 10 分钟；注册同 IP 每小时限 5 次。
+首次登录（注册后）进入方式选择页，任选一种完成绑定；绑定后每次登录都用该方式校验。
+用户的启用方式记在 `users.mfa_method`（`totp` / `email` / `phone`），旧库为空时按
+`totp_enabled` 回退为 `totp`，老用户无需重新绑定。
+
+- 端点：
+  - `GET /setup-2fa` 方式选择页；`GET|POST /setup-2fa/totp` 绑定动态令牌（二维码 + 恢复码）；
+  - `GET|POST /setup-2fa/email`、`GET|POST /setup-2fa/phone` 绑定邮箱 / 手机；
+  - `POST /setup-2fa/:method/send` 重发绑定验证码；
+  - 登录第二步 `GET /2fa`（按方式渲染）、`POST /2fa`（校验）、`POST /2fa/send`（重发验证码）。
+- 验证码：6 位数字，SHA-256 哈希落库、10 分钟有效；邮箱 / 手机各存一列哈希与过期时间。
+  进入页面时若已有未过期验证码则不再重复发送。
+- 目标脱敏展示：邮箱 `u***@domain`、手机 `139****0001`。
+- **开发/测试回显**：`NODE_ENV=development` 或 `MOCK_2FA=1` 时验证码打印到服务端控制台，
+  并在页面上回显（`code-echo`），便于本地走通流程；生产环境不回显。
+- **生产必须接入服务商**（`lib/notify.js` 内的 TODO）：未配置时**自动关闭**邮箱 / 手机方式，
+  选择页仅开放 TOTP，避免用户选了却收不到码被锁死。需要时在 `/etc/loginapp.env` 补：
+  - 邮箱：`SMTP_HOST`（或 `EMAIL_PROVIDER_KEY`）
+  - 短信：`SMS_PROVIDER_KEY`
+  - 临时强制在非生产环境外发/回显：`MOCK_2FA=1`（仅联调用，勿长期开启）
+
+## 七、安全机制备忘
+
+- 密码 bcrypt(cost 12)；登录/二次验证同 IP+账号 5 次失败锁 10 分钟；注册同 IP 每小时限 5 次。
 - 每表单 CSRF token；session cookie HttpOnly + SameSite=Lax + Secure，登录后轮换 ID。
-- 登录两步制：密码 → TOTP 动态口令（首次登录强制绑定）。手机丢失时，2FA 步骤可直接输入恢复码登录（一次性，用后作废；库中存 SHA-256 哈希）。
+- 登录两步制：密码 → 二次验证（TOTP 动态口令 / 邮箱验证码 / 手机验证码，首次登录强制绑定）。
+  TOTP 用户手机丢失时，第二步可直接输入恢复码登录（一次性，用后作废；库中存 SHA-256 哈希）。
 - CSP/X-Frame-Options 等响应头在应用层统一设置；未登录访问 /dashboard 一律跳回登录页。
 - 数据库在 Web 目录之外；备份：`cp /var/lib/loginapp/app.db /backup/path/`（建议 stop 服务后拷）。

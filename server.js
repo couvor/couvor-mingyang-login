@@ -12,6 +12,7 @@ const {
   setSessionCookie, clearSessionCookie,
 } = require('./lib/session');
 const { generateSecret, verifyTotp, otpauthUri } = require('./lib/totp');
+const mfa = require('./lib/mfa');
 const {
   loginLocked, recordLoginFail, clearLoginFails, registerAllowed, recordRegister,
 } = require('./lib/ratelimit');
@@ -158,6 +159,65 @@ const hashRecovery = (code) => crypto.createHash('sha256').update(code.trim().to
 // 占位哈希：用户不存在时也执行一次 bcrypt 比较，抹平时间差
 const DUMMY_HASH = bcrypt.hashSync('timing-equalizer-placeholder', config.bcryptRounds);
 
+// ---------- 多因素认证（MFA）：TOTP / 邮箱 / 手机 ----------
+
+// 用户当前启用的二次验证方式。优先取显式 mfa_method；
+// 旧库（上线时强制 TOTP）mfa_method 为空，按已验证标志回退推断。
+function userMfaMethod(user) {
+  if (!user) return null;
+  if (user.mfa_method) return user.mfa_method;
+  if (user.totp_enabled) return 'totp';
+  if (user.email_verified) return 'email';
+  if (user.phone_verified) return 'phone';
+  return null;
+}
+
+// 该方式当前是否可用（邮箱/手机依赖服务商；未配置时生产环境关闭，避免用户被锁死）。
+function methodEnabled(method) {
+  if (method === 'totp') return true;
+  if (method === 'email') return config.mfa.emailEnabled;
+  if (method === 'phone') return config.mfa.phoneEnabled;
+  return false;
+}
+
+// 展示用的脱敏目标（邮箱只留首字符，手机只留前 3 后 4）。
+function mfaTarget(user, method) {
+  if (method === 'email') {
+    const s = String(user.email || '');
+    const at = s.indexOf('@');
+    if (at <= 0) return s || '你的邮箱';
+    return `${s.slice(0, 1)}${'*'.repeat(Math.max(1, Math.min(3, at - 1)))}${s.slice(at)}`;
+  }
+  if (method === 'phone') {
+    const s = String(user.phone || '');
+    return s.length >= 7 ? `${s.slice(0, 3)}****${s.slice(-4)}` : s || '你的手机';
+  }
+  return '';
+}
+
+// 邮箱/手机方式：确保存在一条未过期的验证码；不存在才发新的，刷新页面不会重复发送。
+async function ensureCode(method, user) {
+  const fresh = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  const expCol = method === 'email' ? 'email_code_expires' : 'phone_code_expires';
+  if (fresh && fresh[expCol] && fresh[expCol] > nowIso()) return { devCode: null, sent: false };
+  const r = await mfa.issueCode(method, user);
+  return { devCode: r.devCode, sent: true };
+}
+
+// 绑定成功：写入启用的方式 → 置为已认证 → 续接 SSO 或回默认落地页。
+function completeMfaSetup(req, res, user, method) {
+  db.prepare('UPDATE users SET mfa_method = ? WHERE id = ?').run(method, user.id);
+  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso(), user.id);
+  req.session = rotateSession(req.session.id, {
+    userId: user.id,
+    state: 'authed',
+    mfaMethod: method,
+  });
+  setSessionCookie(res, req.session.id);
+  const resume = ssoResumeOr(res, req, null);
+  res.redirect(resume || config.defaultRedirect);
+}
+
 // ---------- 路由 ----------
 
 app.get('/healthz', (req, res) => res.type('text').send('ok'));
@@ -219,19 +279,73 @@ app.post('/login', express.urlencoded({ extended: false }), csrfGuard, async (re
   }
 
   clearLoginFails(ip, ipUsername);
-  const state = user.totp_enabled ? 'pending_2fa' : 'setup_2fa';
-  req.session = rotateSession(req.session.id, { userId: user.id, state });
+  const method = userMfaMethod(user);
+  const state = method ? 'pending_2fa' : 'setup_2fa';
+  req.session = rotateSession(req.session.id, { userId: user.id, state, mfaMethod: method });
   setSessionCookie(res, req.session.id);
   res.redirect(state === 'pending_2fa' ? '/2fa' : '/setup-2fa');
 });
 
-// 第二步：动态口令
-app.get('/2fa', (req, res) => {
-  if (req.session.state !== 'pending_2fa' || !req.session.user) return res.redirect('/');
+// 第二步：二次验证（按会话记录的 mfa_method 渲染对应页面）
+app.get('/2fa', async (req, res) => {
+  const s = req.session;
+  if (s.state !== 'pending_2fa' || !s.user) return res.redirect('/');
+  const method = s.mfa_method || userMfaMethod(s.user) || 'totp';
+
+  if (method === 'totp') {
+    return res.send(
+      pages.twofaPage({ csrf: s.csrf_token, username: s.user.username, method: 'totp' })
+    );
+  }
+
+  // 邮箱/手机：进入本页时若还没有有效验证码则自动发送一次（刷新不会重复发）
+  let notice = '';
+  let devCode = null;
+  try {
+    const r = await ensureCode(method, s.user);
+    if (r.sent) notice = `验证码已发送至 ${mfaTarget(s.user, method)}。`;
+    devCode = r.devCode;
+  } catch (e) {
+    console.error('[loginapp] 发送验证码失败:', e);
+    notice = '验证码发送失败，请稍后重试。';
+  }
   res.send(
     pages.twofaPage({
-      csrf: req.session.csrf_token,
-      username: req.session.user.username,
+      csrf: s.csrf_token,
+      username: s.user.username,
+      method,
+      target: mfaTarget(s.user, method),
+      notice,
+      devCode,
+    })
+  );
+});
+
+// 重发登录验证码（仅邮箱/手机方式）
+app.post('/2fa/send', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
+  const s = req.session;
+  if (s.state !== 'pending_2fa' || !s.user) return res.redirect('/');
+  const method = s.mfa_method || userMfaMethod(s.user);
+  if (method !== 'email' && method !== 'phone') return res.redirect('/2fa');
+
+  let notice = '';
+  let devCode = null;
+  try {
+    const r = await mfa.issueCode(method, s.user);
+    notice = `验证码已重新发送至 ${mfaTarget(s.user, method)}。`;
+    devCode = r.devCode;
+  } catch (e) {
+    console.error('[loginapp] 重发验证码失败:', e);
+    notice = '验证码发送失败，请稍后重试。';
+  }
+  res.send(
+    pages.twofaPage({
+      csrf: s.csrf_token,
+      username: s.user.username,
+      method,
+      target: mfaTarget(s.user, method),
+      notice,
+      devCode,
     })
   );
 });
@@ -245,39 +359,51 @@ app.post('/2fa', express.urlencoded({ extended: false }), csrfGuard, (req, res) 
   if (s.state !== 'pending_2fa' || !s.user) return res.redirect('/');
   const ip = req.ip || '';
   const uname = s.user.username;
+  const method = s.mfa_method || userMfaMethod(s.user) || 'totp';
 
   const lock = loginLocked(ip, uname);
   if (lock.locked) return res.redirect('/?locked=1');
 
-  const input = String(req.body.totp || '').trim().toLowerCase();
-
   const succeed = () => {
     clearLoginFails(ip, uname);
     db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso(), s.user.id);
-    req.session = rotateSession(s.id, { userId: s.user.id, state: 'authed' });
+    req.session = rotateSession(s.id, { userId: s.user.id, state: 'authed', mfaMethod: method });
     setSessionCookie(res, req.session.id);
     res.redirect(ssoResumeOr(res, req, config.defaultRedirect));
   };
 
-  if (verifyTotp(s.user.totp_secret, input)) {
-    return succeed();
+  let ok = false;
+
+  if (method === 'totp') {
+    const input = String(req.body.totp || '').trim().toLowerCase();
+    if (verifyTotp(s.user.totp_secret, input)) {
+      ok = true;
+    } else {
+      // TOTP 未通过 → 尝试一次性恢复码（存的是 SHA-256 哈希）
+      const fresh = db.prepare('SELECT * FROM users WHERE id = ?').get(s.user.id);
+      let codes = [];
+      try {
+        codes = JSON.parse(fresh.recovery_codes || '[]');
+      } catch {}
+      const idx = Array.isArray(codes) ? codes.indexOf(hashRecovery(input)) : -1;
+      if (idx !== -1) {
+        codes.splice(idx, 1); // 用掉即作废
+        db.prepare('UPDATE users SET recovery_codes = ? WHERE id = ?').run(
+          JSON.stringify(codes),
+          fresh.id
+        );
+        ok = true;
+      }
+    }
+  } else {
+    const input = String(req.body.code || '').trim();
+    if (mfa.verifyCode(method, s.user.id, input)) {
+      mfa.consumeCode(method, s.user.id);
+      ok = true;
+    }
   }
 
-  // TOTP 未通过 → 尝试一次性恢复码（存的是 SHA-256 哈希）
-  const fresh = db.prepare('SELECT * FROM users WHERE id = ?').get(s.user.id);
-  let codes = [];
-  try {
-    codes = JSON.parse(fresh.recovery_codes || '[]');
-  } catch {}
-  const idx = Array.isArray(codes) ? codes.indexOf(hashRecovery(input)) : -1;
-  if (idx !== -1) {
-    codes.splice(idx, 1); // 用掉即作废
-    db.prepare('UPDATE users SET recovery_codes = ? WHERE id = ?').run(
-      JSON.stringify(codes),
-      fresh.id
-    );
-    return succeed();
-  }
+  if (ok) return succeed();
 
   recordLoginFail(ip, uname);
   const after = loginLocked(ip, uname);
@@ -290,7 +416,12 @@ app.post('/2fa', express.urlencoded({ extended: false }), csrfGuard, (req, res) 
     pages.twofaPage({
       csrf: s.csrf_token,
       username: uname,
-      error: `动态口令不正确（剩余 ${after.remaining} 次尝试）。`,
+      method,
+      target: mfaTarget(s.user, method),
+      error:
+        method === 'totp'
+          ? `动态口令不正确（剩余 ${after.remaining} 次尝试）。`
+          : `验证码不正确（剩余 ${after.remaining} 次尝试）。`,
     })
   );
 });
@@ -366,11 +497,28 @@ app.post('/register', express.urlencoded({ extended: false }), csrfGuard, async 
   res.redirect('/setup-2fa');
 });
 
-// 强制绑定 TOTP
-app.get('/setup-2fa', async (req, res) => {
+// 二次验证绑定 · 方式选择（TOTP / 邮箱 / 手机）
+app.get('/setup-2fa', (req, res) => {
   const s = req.session;
   if (!s.user || !['setup_2fa', 'authed'].includes(s.state)) return res.redirect('/');
-  if (s.user.totp_enabled) return res.redirect('/dashboard');
+  if (userMfaMethod(s.user)) return res.redirect('/dashboard');
+  res.send(
+    pages.setupChoosePage({
+      username: s.user.username,
+      email: s.user.email || '',
+      phone: s.user.phone || '',
+      emailEnabled: config.mfa.emailEnabled,
+      phoneEnabled: config.mfa.phoneEnabled,
+      error: req.query.e === '1' ? '该方式暂不可用，请选择其他方式。' : '',
+    })
+  );
+});
+
+// 二次验证绑定 · 动态令牌（TOTP）
+app.get('/setup-2fa/totp', async (req, res) => {
+  const s = req.session;
+  if (!s.user || !['setup_2fa', 'authed'].includes(s.state)) return res.redirect('/');
+  if (userMfaMethod(s.user)) return res.redirect('/dashboard');
 
   let secret = s.user.totp_secret;
   if (!secret) {
@@ -414,13 +562,13 @@ app.get('/setup-2fa', async (req, res) => {
   );
 });
 
-app.post('/setup-2fa', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
+app.post('/setup-2fa/totp', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
   const s = req.session;
   if (!s.user || !['setup_2fa', 'authed'].includes(s.state)) return res.redirect('/');
-  if (s.user.totp_enabled) return res.redirect('/dashboard');
+  if (userMfaMethod(s.user)) return res.redirect('/dashboard');
 
   if (!verifyTotp(s.user.totp_secret, req.body.totp)) {
-    return res.redirect('/setup-2fa?e=1');
+    return res.redirect('/setup-2fa/totp?e=1');
   }
 
   // 启用：恢复码明文替换为哈希
@@ -433,13 +581,88 @@ app.post('/setup-2fa', express.urlencoded({ extended: false }), csrfGuard, (req,
     JSON.stringify(hashed),
     s.user.id
   );
-  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso(), s.user.id);
 
-  req.session = rotateSession(s.id, { userId: s.user.id, state: 'authed' });
-  setSessionCookie(res, req.session.id);
   // 有待续 SSO 请求则续接回客户端；否则回默认落地页（默认直接续接学桥 SSO）
-  const resume = ssoResumeOr(res, req, null);
-  res.redirect(resume || config.defaultRedirect);
+  completeMfaSetup(req, res, s.user, 'totp');
+});
+
+// 二次验证绑定 · 邮箱 / 手机（发送 + 校验一次性验证码）
+app.get('/setup-2fa/:method', async (req, res) => {
+  const method = req.params.method;
+  if (method !== 'email' && method !== 'phone') return res.redirect('/setup-2fa');
+  const s = req.session;
+  if (!s.user || !['setup_2fa', 'authed'].includes(s.state)) return res.redirect('/');
+  if (userMfaMethod(s.user)) return res.redirect('/dashboard');
+  if (!methodEnabled(method)) return res.redirect('/setup-2fa?e=1');
+
+  let notice = '';
+  let devCode = null;
+  try {
+    const r = await ensureCode(method, s.user);
+    if (r.sent) notice = `验证码已发送至 ${mfaTarget(s.user, method)}。`;
+    devCode = r.devCode;
+  } catch (e) {
+    console.error('[loginapp] 发送验证码失败:', e);
+    notice = '验证码发送失败，请稍后重试。';
+  }
+  res.send(
+    pages.setupCodePage({
+      csrf: s.csrf_token,
+      method,
+      target: mfaTarget(s.user, method),
+      username: s.user.username,
+      notice,
+      devCode,
+      error: req.query.e === '1' ? '验证码不正确，请重试。' : '',
+    })
+  );
+});
+
+app.post('/setup-2fa/:method/send', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
+  const method = req.params.method;
+  if (method !== 'email' && method !== 'phone') return res.redirect('/setup-2fa');
+  const s = req.session;
+  if (!s.user || !['setup_2fa', 'authed'].includes(s.state)) return res.redirect('/');
+  if (userMfaMethod(s.user)) return res.redirect('/dashboard');
+  if (!methodEnabled(method)) return res.redirect('/setup-2fa?e=1');
+
+  let notice = '';
+  let devCode = null;
+  try {
+    const r = await mfa.issueCode(method, s.user);
+    notice = `验证码已重新发送至 ${mfaTarget(s.user, method)}。`;
+    devCode = r.devCode;
+  } catch (e) {
+    console.error('[loginapp] 重发验证码失败:', e);
+    notice = '验证码发送失败，请稍后重试。';
+  }
+  res.send(
+    pages.setupCodePage({
+      csrf: s.csrf_token,
+      method,
+      target: mfaTarget(s.user, method),
+      username: s.user.username,
+      notice,
+      devCode,
+    })
+  );
+});
+
+app.post('/setup-2fa/:method', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
+  const method = req.params.method;
+  if (method !== 'email' && method !== 'phone') return res.redirect('/setup-2fa');
+  const s = req.session;
+  if (!s.user || !['setup_2fa', 'authed'].includes(s.state)) return res.redirect('/');
+  if (userMfaMethod(s.user)) return res.redirect('/dashboard');
+  if (!methodEnabled(method)) return res.redirect('/setup-2fa?e=1');
+
+  const input = String(req.body.code || '').trim();
+  if (!mfa.verifyCode(method, s.user.id, input)) {
+    return res.redirect(`/setup-2fa/${method}?e=1`);
+  }
+  mfa.consumeCode(method, s.user.id);
+  db.prepare(`UPDATE users SET ${method}_verified = 1 WHERE id = ?`).run(s.user.id);
+  completeMfaSetup(req, res, s.user, method);
 });
 
 // 本服务不设独立控制台：认证完成后一律续接回应用（默认落地），

@@ -47,6 +47,24 @@ module.exports = {
     secure: process.env.COOKIE_SECURE === '1', // HTTPS 上线后设为 1
   },
 
+  // 多因素认证（MFA）：TOTP / 邮箱 / 手机 三选一。
+  // 邮箱与手机方式依赖外部服务商（由 lib/notify.js 真实发送验证码）：
+  //   - 开发/测试（NODE_ENV=development 或 MOCK_2FA=1）下始终可用，验证码仅打印到服务端控制台；
+  //   - 生产环境仅在配置了对应服务商后才开放，避免用户选了却收不到码而被锁死。
+  // 相关环境变量（/etc/loginapp.env）：SMTP_HOST 或 EMAIL_PROVIDER_KEY（邮箱），SMS_PROVIDER_KEY（短信）。
+  mfa: (() => {
+    const isDevEnv =
+      (process.env.NODE_ENV || 'development') === 'development' || process.env.MOCK_2FA === '1';
+    const emailProvider = !!(process.env.SMTP_HOST || process.env.EMAIL_PROVIDER_KEY);
+    const smsProvider = !!(process.env.SMS_PROVIDER_KEY);
+    return {
+      codeTtlMs: 10 * 60 * 1000, // 验证码 10 分钟有效
+      emailEnabled: isDevEnv || emailProvider,
+      phoneEnabled: isDevEnv || smsProvider,
+      providers: { email: emailProvider, sms: smsProvider },
+    };
+  })(),
+
   // 限频：同 IP+用户名 10 分钟窗口内失败 5 次锁定
   rateLimit: {
     windowMs: 10 * 60 * 1000,

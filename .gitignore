@@ -15,3 +15,6 @@ node_modules/
 
 # 杂项
 .DS_Store
+
+# 本地预览/测试数据库（运行时生成，非项目资产）
+_preview/
