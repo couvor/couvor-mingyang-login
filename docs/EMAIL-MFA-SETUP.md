@@ -16,7 +16,7 @@
 | 发信域名 MX | `mxbiz1.qq.com`（1 条） | ✅ |
 | 发信域名 SPF | `v=spf1 include:qcloudmail.com ~all` | ✅ |
 | 发信域名 DMARC | `_dmarc.m.mingyanginfo.com` = `v=DMARC1; p=none` | ✅ |
-| 发信域名 DKIM | `qcloud._domainkey.m` / `qcloudsg1024._domainkey.m` / `qcloudsg2048._domainkey.m` **三条都查不到** | ❌ **缺失** |
+| 发信域名 DKIM | 实际主机记录是 **`qcloudhk2048._domainkey.m`**（香港站专属前缀，非 `qcloudsg*`），`Status: true` | ✅ **已通过**（早先按 `qcloud*` 三种名字查不到，属误判） |
 | 代码发送方式 | `SendEmail` 的 `Simple`（自定义 HTML/Text） | ❌ **官方已废弃**，仅历史申请过特殊配置的客户可用；默认账号只能用**模板发送** → 已改为模板发送（见第 6 节） |
 | SMTP 密码 `SES_SMTP_PASS` | 仍为 `__REPLACE_ME__` 占位符 | ❌ 未启用（故当前实际走 API 通道） |
 | 前端入口 | TOTP ✅ / 邮箱 ✅ / 手机「暂不可用」（按要求屏蔽） | ✅ |
@@ -167,10 +167,44 @@ cd /www/wwwroot/login.mingyanginfo.com \
   → `{ "delivered": true }`，MessageId `qcloudses-30-...-QW2OwZpNT0Uk1`。
   说明 CAM 密钥有 `ses:SendEmail` 权限、模板 224198 可用、地域 ap-hongkong 正确。
 
-## 7. 还差最后一步：确认模板内容 + 真人验收
+## 6.5 已修复：模板里验证码是写死的（重要）
 
-1. **核对控制台模板 224198 的内容**：把 `docs/verify-email-template.html` 上传/粘贴进去
-   （变量 `{{code}}`、`{{email}}`、`{{minutes}}`）。若模板里已是这份内容则不用动。
+用 `GetEmailTemplate` 读到模板 224198 的真实内容后发现：HTML 虽然是我们那份设计，
+但**验证码、邮箱、IP 全是写死的**（`824613` / `hello@example.com` / `113.140.11.28`），
+没有任何 `{{变量}}` → 用户收到的邮件里永远显示同一个假验证码。
+
+已处理（`UpdateEmailTemplate`，原模板已备份）：
+- HTML 换成 `docs/verify-email-template.html`（含 `{{code}}` / `{{email}}` / `{{minutes}}`）
+- 补上真正的纯文本版本（原来 Text 是"向用户发送验证码的模板"这句占位符，
+  而"缺少纯文本版本"正是官方列出的进垃圾箱因素之一）
+
+⚠️ **改模板会触发重新审核**，审核期间发送会报
+`FailedOperation.InvalidTemplateID`（模板 ID 无效或者不可用），属正常现象，等通过即可。
+
+## 7. 送达率 / 进入垃圾箱：原因与对策
+
+域名侧能做的都做完了（MX / SPF / DKIM / DMARC 四项 `Status` 全为 true），
+剩下的是**域名信誉**与**内容结构**问题。控制台实测：
+`CurrentReputationLevel = 1`（当前最低等级）、`DailyQuota = 500`。
+
+按官方《送达率相关问题》《垃圾箱相关问题》文档，对策按见效速度排序：
+
+| 优先级 | 做法 | 说明 |
+|---|---|---|
+| 立刻 | 在 QQ 邮箱里把 `no-reply@m.mingyanginfo.com` **加入通讯录/白名单**，并对垃圾箱里的那封点「不是垃圾邮件」 | 收件方的正反馈（打开、加为重要联系人）直接影响后续判定 |
+| 立刻 | 给模板补纯文本版本 | **已做**（见 6.5） |
+| 短期 | **新域名 warm up**：稳定、低频、真实地发触发类邮件，持续约 1 个月 | 官方明确：新域名在收件方没有信誉度，开始进垃圾箱是正常的，持续发"良好的验证类邮件"会逐渐移送至收件箱 |
+| 短期 | 保持**低退信率、低投诉率、高打开率** | 无效地址导致的硬退信是信誉杀手（拉黑率达 8% 会被自动停发） |
+| 可选 | 用 [mail-tester](https://www.mail-tester.com/) 测内容评分，目标 > 8 | 官方推荐做法 |
+| 中期 | 购买**独立 IP** | 共享 IP 池的声誉是共享的，容易被连坐 |
+| 中期 | 国内收件人可考虑改用 **ap-guangzhou** 地域 | 当前是 `ap-hongkong`；换地域需重新建发信域名与模板 |
+| 兜底 | 改走 **SMTP 通道** | 代码已支持（填 `SES_SMTP_PASS` 即自动优先），好处是 HTML+纯文本都由代码控制，且不受模板审核影响 |
+
+## 8. 还差最后一步：确认模板内容 + 真人验收
+
+1. ~~核对控制台模板 224198 的内容~~ → **已由 API 直接更新完成**（见 6.5），
+   当前卡在**模板重新审核**。请在控制台「邮件模板」看 224198 的状态，
+   审核通过后告诉我，我立刻重发一封验证。
    ⚠️ 模板发送时**正文由控制台模板决定**，代码里的 HTML 只作用于 SMTP 通道。
 2. **给一个你能收信的邮箱**，我发一封真实验证码，你确认：样式是否正常、
    `{{code}}` / `{{email}}` / `{{minutes}}` 是否都被正确替换。
