@@ -37,6 +37,19 @@ function buildTencent() {
   const hasCredential = !!secretId && !!secretKey;
   // 短信要齐全（应用、签名、模板）才视为可用
   const smsConfigured = hasCredential && !!smsSdkAppId && !!smsSign && !!smsTemplateId;
+  // 邮件模板发送。腾讯云 SES 的 Simple（自定义内容）字段官方已标注废弃，
+  // 默认账号只能"模板发送"，否则报 SendStatus 1011 / FailedOperation.WithOutPermission。
+  // 在控制台建好模板后，把 TemplateID 填到 TENCENT_SES_TEMPLATE_ID；
+  // 模板正文中的变量写作 {{键}}，发送时用 TemplateData 传值（见 lib/notify.js）。
+  // 变量清单默认 code,minutes,email，可用 TENCENT_SES_TEMPLATE_VARS 覆盖（逗号分隔）。
+  // 注意：部分版本的控制台限制"单发模板只支持一个变量"，若发送报 3010
+  // （TemplateData 字段格式不正确），把该变量改成只留 code，其余在模板里写死。
+  const sesTemplateId = parseInt(envVal('TENCENT_SES_TEMPLATE_ID') || '0', 10);
+  const sesTemplateVars = (process.env.TENCENT_SES_TEMPLATE_VARS || 'code,minutes,email')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
   // 邮件只需发信地址（仍需在控制台完成验证/认证，否则 SendEmail 会报 NoSuchSender）
   const sesApiConfigured = hasCredential && !!sesFromAddress;
   // 邮件整体可用 = SMTP 通道 或 API 通道 任一配齐（SMTP 优先）
@@ -66,6 +79,8 @@ function buildTencent() {
         configured: smtpConfigured,
       },
       region: (process.env.TENCENT_SES_REGION || 'ap-hongkong').trim(),
+      templateId: Number.isFinite(sesTemplateId) ? sesTemplateId : 0,
+      templateVars: sesTemplateVars,
       configured: sesConfigured,
     },
   };
