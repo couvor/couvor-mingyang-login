@@ -17,7 +17,7 @@
 | 发信域名 SPF | `v=spf1 include:qcloudmail.com ~all` | ✅ |
 | 发信域名 DMARC | `_dmarc.m.mingyanginfo.com` = `v=DMARC1; p=none` | ✅ |
 | 发信域名 DKIM | `qcloud._domainkey.m` / `qcloudsg1024._domainkey.m` / `qcloudsg2048._domainkey.m` **三条都查不到** | ❌ **缺失** |
-| 代码发送方式 | `SendEmail` 的 `Simple`（自定义 HTML/Text） | ❌ **官方已废弃**，仅历史申请过特殊配置的客户可用；默认账号只能用**模板发送** |
+| 代码发送方式 | `SendEmail` 的 `Simple`（自定义 HTML/Text） | ❌ **官方已废弃**，仅历史申请过特殊配置的客户可用；默认账号只能用**模板发送** → 已改为模板发送（见第 6 节） |
 | SMTP 密码 `SES_SMTP_PASS` | 仍为 `__REPLACE_ME__` 占位符 | ❌ 未启用（故当前实际走 API 通道） |
 | 前端入口 | TOTP ✅ / 邮箱 ✅ / 手机「暂不可用」（按要求屏蔽） | ✅ |
 
@@ -153,8 +153,27 @@ cd /www/wwwroot/login.mingyanginfo.com \
 
 ---
 
-## 6. 我需要的三个信息
+## 6. 进展（2026-10-10）
 
-1. 走 **路线 A** 还是 **路线 B**
-2. 若走 A：**邮件模板的 TemplateID**
-3. 一个**用于实测的收件邮箱**
+- 已选定**路线 A（模板发送）**，TemplateID = **224198**，已写入 `/etc/loginapp.env`：
+  `TENCENT_SES_TEMPLATE_ID=224198`（追加，未改动任何原有配置）。
+- 代码已改造（commit `8d88845`）：
+  - 新增 `lib/verifyEmailTemplate.js`：设计规范版验证码邮件（内联 logo、浅色默认 + 暗色渐进增强）。
+  - `config.js` 新增 `ses.templateId` / `ses.templateVars`（默认 `code,minutes,email`，
+    可用 `TENCENT_SES_TEMPLATE_VARS` 覆盖）。
+  - `lib/notify.js`：API 通道优先 `Template` 发送，未配模板时才走 `Simple`；
+    SMTP 通道仍优先，且直接发这份 HTML。
+- **实测已通**：`sendVerificationEmail('no-reply@m.mingyanginfo.com','123456')`
+  → `{ "delivered": true }`，MessageId `qcloudses-30-...-QW2OwZpNT0Uk1`。
+  说明 CAM 密钥有 `ses:SendEmail` 权限、模板 224198 可用、地域 ap-hongkong 正确。
+
+## 7. 还差最后一步：确认模板内容 + 真人验收
+
+1. **核对控制台模板 224198 的内容**：把 `docs/verify-email-template.html` 上传/粘贴进去
+   （变量 `{{code}}`、`{{email}}`、`{{minutes}}`）。若模板里已是这份内容则不用动。
+   ⚠️ 模板发送时**正文由控制台模板决定**，代码里的 HTML 只作用于 SMTP 通道。
+2. **给一个你能收信的邮箱**，我发一封真实验证码，你确认：样式是否正常、
+   `{{code}}` / `{{email}}` / `{{minutes}}` 是否都被正确替换。
+   - 若变量没被替换（页面上还显示 `{{code}}` 原文）→ 说明控制台模板里的变量名不一致，按实际改。
+   - 若报 `3010 TemplateData 字段格式不正确` → 单发模板只允许一个变量，
+     把 `TENCENT_SES_TEMPLATE_VARS` 改成只留 `code`，其余在模板里写死。
