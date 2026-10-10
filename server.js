@@ -141,6 +141,8 @@ function timingSafeEqualStr(a, b) {
 }
 
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,24}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/; // 基础邮箱格式校验
+const PHONE_RE = /^1[3-9]\d{9}$/; // 11 位中国大陆手机号
 
 // 生成 10 个恢复码（明文显示一次；启用后数据库只存哈希）
 function generateRecoveryCodes() {
@@ -301,12 +303,16 @@ app.get('/register', (req, res) => {
 
 app.post('/register', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
   const username = String(req.body.username || '').trim();
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const phone = String(req.body.phone || '').trim();
   const password = String(req.body.password || '');
   const password2 = String(req.body.password2 || '');
   const ip = req.ip || '';
 
   const fail = (msg, code = 400) =>
-    res.status(code).send(pages.registerPage({ csrf: req.session.csrf_token, username, error: msg }));
+    res.status(code).send(
+      pages.registerPage({ csrf: req.session.csrf_token, username, email, phone, error: msg })
+    );
 
   if (!registerAllowed(ip)) {
     return fail('该 IP 注册过于频繁，请一小时后再试。', 429);
@@ -319,6 +325,12 @@ app.post('/register', express.urlencoded({ extended: false }), csrfGuard, async 
   if (!USERNAME_RE.test(username)) {
     return fail('用户名需为 3–24 位字母、数字或下划线。');
   }
+  if (!EMAIL_RE.test(email)) {
+    return fail('请输入有效的邮箱地址。');
+  }
+  if (!PHONE_RE.test(phone)) {
+    return fail('请输入有效的 11 位手机号码。');
+  }
   if (password.length < 8 || password.length > 72) {
     return fail('密码长度需在 8–72 位之间。');
   }
@@ -330,11 +342,19 @@ app.post('/register', express.urlencoded({ extended: false }), csrfGuard, async 
   if (exists) {
     return fail('该用户名已被使用，换一个试试。');
   }
+  const emailExists = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  if (emailExists) {
+    return fail('该邮箱已被注册，换一个试试。');
+  }
+  const phoneExists = db.prepare('SELECT id FROM users WHERE phone = ?').get(phone);
+  if (phoneExists) {
+    return fail('该手机号码已被注册，换一个试试。');
+  }
 
   const hash = await bcrypt.hash(password, config.bcryptRounds);
   const result = db
-    .prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)')
-    .run(username, hash, nowIso());
+    .prepare('INSERT INTO users (username, password_hash, email, phone, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(username, hash, email, phone, nowIso());
 
   recordRegister(ip);
   // 注册即登录，进入强制 2FA 绑定
