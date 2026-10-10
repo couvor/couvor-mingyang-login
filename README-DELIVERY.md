@@ -116,6 +116,22 @@ tencentcloud-sdk-nodejs-sms
 | `TENCENT_SMS_TEMPLATE_ID` | 验证码模板 ID | `123456` |
 | `TENCENT_SMS_TEMPLATE_PARAMS` | 可选，模板参数顺序，默认 `CODE,MINUTES` | `CODE,MINUTES` |
 | `TENCENT_SMS_REGION` | 短信地域，默认 `ap-guangzhou` | `ap-guangzhou` |
+
+密钥同样只写入 `/etc/loginapp.env`（600，root），交互式填写（SecretKey 不回显）：
+
+```bash
+set -e
+F=/etc/loginapp.env
+read -r  -p 'SecretId: '      A
+read -rs -p 'SecretKey: '     B; echo
+read -r  -p 'SdkAppId: '      C
+read -r  -p '签名内容: '       D
+read -r  -p 'TemplateId: '    E
+grep -v -E '^(TENCENT_SECRET_ID|TENCENT_SECRET_KEY|TENCENT_SMS_SDK_APP_ID|TENCENT_SMS_SIGN|TENCENT_SMS_TEMPLATE_ID)=' "$F" > /tmp/env.new
+printf 'TENCENT_SECRET_ID=%s\nTENCENT_SECRET_KEY=%s\nTENCENT_SMS_SDK_APP_ID=%s\nTENCENT_SMS_SIGN=%s\nTENCENT_SMS_TEMPLATE_ID=%s\n' "$A" "$B" "$C" "$D" "$E" >> /tmp/env.new
+install -m 600 /tmp/env.new "$F"; rm -f /tmp/env.new; unset A B C D E
+systemctl restart loginapp && systemctl is-active loginapp
+```
 | `TENCENT_SES_FROM_ADDRESS` | 已验证的发信地址 | `noreply@mail.mingyanginfo.com` |
 | `TENCENT_SES_REGION` | SES 地域，默认 `ap-hongkong`（国内站常用 `ap-guangzhou`） | `ap-hongkong` |
 
