@@ -119,9 +119,36 @@ tencentcloud-sdk-nodejs-sms
 | `TENCENT_SES_FROM_ADDRESS` | 已验证的发信地址 | `noreply@mail.mingyanginfo.com` |
 | `TENCENT_SES_REGION` | SES 地域，默认 `ap-hongkong`（国内站常用 `ap-guangzhou`） | `ap-hongkong` |
 
+#### 邮件通道二：SES SMTP（推荐，无需 CAM 密钥）
+
+腾讯云 SES 在「发信地址」页同时提供 **SMTP** 发送方式（`smtp.qcloudmail.com`，端口
+465 SSL / 587 STARTTLS / 25），只需**发信地址 + SMTP 密码**，不需要 CAM 的
+`SecretId` / `SecretKey`。代码优先使用该通道，未配置时才回退到上面的 API 通道。
+
+| 变量 | 说明 | 示例 |
+| --- | --- | --- |
+| `SES_SMTP_HOST` | SMTP 服务地址，默认已内置 | `smtp.qcloudmail.com` |
+| `SES_SMTP_PORT` | `465`（隐式 SSL）/ `587`（STARTTLS）/ `25`，默认 `465` | `465` |
+| `SES_SMTP_USER` | SMTP 账号，默认取发信地址 | `no-reply@m.mingyanginfo.com` |
+| `SES_SMTP_PASS` | **SMTP 密码（机密）**，留 `__REPLACE_ME__` 视为未配置 | — |
+| `SES_FROM_NAME` | 发件人显示名，默认「明旸信息」 | `明旸信息` |
+
+密码只应写入 `/etc/loginapp.env`（600，root），不要粘贴到聊天、工单或日志。写入方式
+（交互式，不回显、不留历史）：
+
+```bash
+read -r -s -p 'SMTP 密码: ' P \
+&& grep -v '^SES_SMTP_PASS=' /etc/loginapp.env > /tmp/env.new \
+&& printf 'SES_SMTP_PASS=%s\n' "$P" >> /tmp/env.new \
+&& install -m 600 /tmp/env.new /etc/loginapp.env && rm -f /tmp/env.new && unset P \
+&& systemctl restart loginapp
+```
+
 **开关与降级行为**
 
-- 短信需**密钥 + SdkAppId + 签名 + 模板**齐全才视为已配置；邮件需**密钥 + 发信地址**。
+- 短信需**密钥 + SdkAppId + 签名 + 模板**齐全才视为已配置。
+- 邮件需 **SMTP 通道**（主机 + 账号 + 真实密码）或 **API 通道**（密钥 + 发信地址）之一配齐；
+  密码为 `__REPLACE_ME__` 占位符或空值时一律视为未配置，避免在页面上提前开放却发不出信。
 - 未配置时对应方式**在选择页自动关闭**（只留 TOTP），用户不会选到收不到码的方式而被锁死。
 - 已配置但调用失败（额度耗尽、模板审核未过、发信地址未验证等）时：
   打印错误日志并在页面提示「验证码发送失败」，**不会**假装已发送。
