@@ -1,6 +1,6 @@
 /* ============================================================
    明旸信息 设计系统 — 登录站点复刻版
-   依据 01-DESIGN_SPEC.md：暗色默认、CSS 变量、品牌蓝唯一 accent、
+   依据 DESIGN_SPEC.md：亮色默认、CSS 变量、品牌蓝唯一 accent、
    mono 小标签、2px 方角按钮、发丝边框、玻璃表单卡。
    ============================================================ */
 
@@ -60,25 +60,6 @@
 
 /* ---------- 主题变量（规范 §3） ---------- */
 :root {
-  --bg: #0a0a0c;
-  --fg: #eceae4;
-  --mute: #90909a;
-  --dim: #5a5a63;
-  --surface: #1d1d23;
-  --line: rgb(236 234 228 / .08);
-  --line-strong: rgb(236 234 228 / .18);
-  --accent: #1d67ea;
-  --accent-soft: #6ea8ff;
-  --err: #e5484d;
-  --card-shadow: 0 28px 90px rgb(0 0 0 / .34);
-  --glass-bg: rgb(10 10 12 / .55);
-  --ease: cubic-bezier(0.16, 1, 0.3, 1);
-  --font-serifcn: 'Noto Serif SC', 'Songti SC', 'SimSun', serif;
-  --font-serif: 'Instrument Serif', Georgia, serif;
-  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
-  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
-}
-html.light {
   --bg: #f4f1ea;
   --fg: #17171b;
   --mute: #63636b;
@@ -88,8 +69,27 @@ html.light {
   --line-strong: rgb(23 23 27 / .24);
   --accent: #1d67ea;
   --accent-soft: #1a5adf;
+  --err: #e5484d;
   --card-shadow: 0 28px 90px rgb(23 23 27 / .14);
   --glass-bg: rgb(244 241 234 / .62);
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --font-serifcn: 'Noto Serif SC', 'Songti SC', 'SimSun', serif;
+  --font-serif: 'Instrument Serif', Georgia, serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+}
+html.dark {
+  --bg: #0a0a0c;
+  --fg: #eceae4;
+  --mute: #90909a;
+  --dim: #5a5a63;
+  --surface: #1d1d23;
+  --line: rgb(236 234 228 / .08);
+  --line-strong: rgb(236 234 228 / .18);
+  --accent: #1d67ea;
+  --accent-soft: #6ea8ff;
+  --card-shadow: 0 28px 90px rgb(0 0 0 / .34);
+  --glass-bg: rgb(10 10 12 / .55);
 }
 
 /* ---------- 基础 ---------- */
@@ -115,12 +115,12 @@ p { margin: 0; }
 
 /* ---------- 氛围（规范 §6，克制） ---------- */
 .grain {
-  position: fixed; inset: 0; z-index: 60; pointer-events: none; opacity: .32;
+  position: fixed; inset: 0; z-index: 60; pointer-events: none; opacity: .5;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
 }
-html.light .grain { opacity: .5; }
+html.dark .grain { opacity: .32; }
 .bg-grid {
-  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  position: fixed; inset: 0; z-index: 0; pointer-events: none; opacity: .9;
   background-image:
     linear-gradient(var(--line) 1px, transparent 1px),
     linear-gradient(90deg, var(--line) 1px, transparent 1px);
@@ -128,11 +128,13 @@ html.light .grain { opacity: .5; }
   -webkit-mask-image: radial-gradient(ellipse 90% 70% at 50% 38%, black 26%, transparent 78%);
           mask-image: radial-gradient(ellipse 90% 70% at 50% 38%, black 26%, transparent 78%);
 }
+html.dark .bg-grid { opacity: 1; }
 .ambient {
   position: fixed; top: -160px; right: -140px; z-index: 0; pointer-events: none;
   width: 560px; height: 560px; border-radius: 50%;
-  background: var(--accent); filter: blur(110px); opacity: .1;
+  background: var(--accent); filter: blur(110px); opacity: .13;
 }
+html.dark .ambient { opacity: .1; }
 
 /* ---------- 头部与品牌锁屏（规范 §9） ---------- */
 .site-head {
@@ -155,9 +157,9 @@ html.light .grain { opacity: .5; }
   transition: color .3s var(--ease), border-color .3s var(--ease), transform .3s var(--ease);
 }
 .theme-btn:hover { color: var(--fg); border-color: var(--line-strong); transform: translateY(-2px); }
-.theme-btn .icon-moon { display: none; }
-html.light .theme-btn .icon-moon { display: block; }
-html.light .theme-btn .icon-sun { display: none; }
+.theme-btn .icon-sun { display: none; }
+html.dark .theme-btn .icon-sun { display: block; }
+html.dark .theme-btn .icon-moon { display: none; }
 
 /* ---------- 中央布局 ---------- */
 .auth-wrap {
@@ -437,10 +439,6 @@ a.method-choice:hover {
   .text-outline { display: none; }
   .site-foot { font-size: 9px; letter-spacing: .14em; }
 }
-
-/* ---------- 亮色模式纹理适配 ---------- */
-html.light .ambient { opacity: .13; }
-html.light .bg-grid { opacity: .9; }
 
 /* ---------- 减少动效（规范 §8 必须保留） ---------- */
 @media (prefers-reduced-motion: reduce) {
