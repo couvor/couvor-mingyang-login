@@ -22,8 +22,12 @@ function buildTencent() {
   const smtpPort = parseInt(process.env.SES_SMTP_PORT || '465', 10);
   const smtpUser = (process.env.SES_SMTP_USER || sesFromAddress).trim();
   // 密码不做 trim：首尾空格可能是密码的一部分
-  const smtpPass = process.env.SES_SMTP_PASS || '';
-  const smtpConfigured = !!smtpHost && !!smtpUser && !!smtpPass;
+  // 密码不做 trim（首尾空格可能是密码的一部分）；占位符一律视为未配置，
+  // 避免"看似配好、实际发不出"把用户锁在邮箱验证上。
+  const smtpPassRaw = process.env.SES_SMTP_PASS || '';
+  const smtpPassIsPlaceholder = !smtpPassRaw || smtpPassRaw.includes('__REPLACE_ME__');
+  const smtpPass = smtpPassIsPlaceholder ? '' : smtpPassRaw;
+  const smtpConfigured = !!smtpHost && !!smtpUser && !smtpPassIsPlaceholder;
 
   const hasCredential = !!secretId && !!secretKey;
   // 短信要齐全（应用、签名、模板）才视为可用
