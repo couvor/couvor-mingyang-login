@@ -1,0 +1,577 @@
+'use strict';
+
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const QRCode = require('qrcode');
+
+const config = require('./config');
+const { db, nowIso, cleanupExpiredSessions } = require('./lib/db');
+const {
+  createSession, getSession, rotateSession, destroySession,
+  setSessionCookie, clearSessionCookie,
+} = require('./lib/session');
+const { generateSecret, verifyTotp, otpauthUri } = require('./lib/totp');
+const {
+  loginLocked, recordLoginFail, clearLoginFails, registerAllowed, recordRegister,
+} = require('./lib/ratelimit');
+const { verifyTurnstile } = require('./lib/turnstile');
+const pages = require('./lib/pages');
+
+const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+
+// ---------- 安全响应头 ----------
+app.use((req, res, next) => {
+  res.setHeader(
+    'Content-Security-Policy',
+    [
+      "default-src 'self'",
+      "base-uri 'self'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+      "img-src 'self' data:",
+      "style-src 'self' 'unsafe-inline'",
+      "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com",
+      "frame-src https://challenges.cloudflare.com",
+      "connect-src https://challenges.cloudflare.com",
+      "object-src 'none'",
+    ].join('; ')
+  );
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
+
+// ---------- 静态资源 ----------
+app.use(
+  express.static(require('path').join(__dirname, 'public'), {
+    maxAge: '1d',
+    setHeaders(res, filePath) {
+      if (filePath.endsWith('.woff2')) {
+        res.setHeader('Cache-Control', 'public, max-age=2592000, immutable');
+      }
+    },
+  })
+);
+
+// ---------- SSO 辅助（本服务作为 IdP） ----------
+const SSO_PENDING_COOKIE = 'sso_pending';
+
+function parseCookies(req) {
+  try {
+    return Object.fromEntries(
+      (req.headers.cookie || '')
+        .split(';')
+        .map((p) => p.trim().split('=').map(decodeURIComponent))
+        .filter((p) => p.length === 2)
+    );
+  } catch {
+    return {};
+  }
+}
+
+function ssoPendingFrom(req) {
+  const raw = parseCookies(req)[SSO_PENDING_COOKIE];
+  if (!raw) return null;
+  try {
+    const p = JSON.parse(raw);
+    if (!p || typeof p.client_id !== 'string' || typeof p.redirect_uri !== 'string') return null;
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+function clearSsoPending(res) {
+  res.append(
+    'Set-Cookie',
+    `${SSO_PENDING_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${config.session.secure ? '; Secure' : ''}`
+  );
+}
+
+// 登录成功后若存在待续 SSO 请求，回到 /sso/authorize（参数会重新校验）；否则回 fallback
+function ssoResumeOr(res, req, fallback) {
+  const p = ssoPendingFrom(req);
+  if (!p) return fallback;
+  clearSsoPending(res);
+  const q = new URLSearchParams({ client_id: p.client_id, redirect_uri: p.redirect_uri });
+  if (p.state) q.set('state', p.state);
+  return `/sso/authorize?${q.toString()}`;
+}
+
+// ---------- 会话装载 ----------
+app.use((req, res, next) => {
+  const cookies = parseCookies(req);
+  let session = getSession(cookies[config.session.cookieName]);
+  if (!session) {
+    session = createSession(req);
+    setSessionCookie(res, session.id);
+  }
+  req.session = session;
+  next();
+});
+
+// CSRF 校验（所有 POST）
+function csrfGuard(req, res, next) {
+  const given = String(req.body._csrf || '');
+  const expect = req.session.csrf_token || '';
+  const ok =
+    given.length === expect.length &&
+    crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expect));
+  if (!ok) {
+    return res.status(403).send(
+      pages.messagePage({
+        title: '请求被拒绝',
+        kicker: 'CSRF / 403',
+        message: '表单校验失败，请返回重新提交。',
+      })
+    );
+  }
+  next();
+}
+
+function timingSafeEqualStr(a, b) {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+
+const USERNAME_RE = /^[a-zA-Z0-9_]{3,24}$/;
+
+// 生成 10 个恢复码（明文显示一次；启用后数据库只存哈希）
+function generateRecoveryCodes() {
+  const codes = [];
+  for (let i = 0; i < 10; i++) {
+    codes.push(crypto.randomBytes(4).toString('hex') + '-' + crypto.randomBytes(4).toString('hex'));
+  }
+  return codes;
+}
+
+const hashRecovery = (code) => crypto.createHash('sha256').update(code.trim().toLowerCase()).digest('hex');
+
+// 占位哈希：用户不存在时也执行一次 bcrypt 比较，抹平时间差
+const DUMMY_HASH = bcrypt.hashSync('timing-equalizer-placeholder', config.bcryptRounds);
+
+// ---------- 路由 ----------
+
+app.get('/healthz', (req, res) => res.type('text').send('ok'));
+
+// 登录页
+app.get('/', (req, res) => {
+  const s = req.session;
+  if (s.state === 'authed') return res.redirect('/dashboard');
+  if (s.state === 'pending_2fa') return res.redirect('/2fa');
+  if (s.state === 'setup_2fa') return res.redirect('/setup-2fa');
+  const loggedOut = req.query.bye === '1';
+  res.send(
+    pages.loginPage({
+      csrf: s.csrf_token,
+      notice: loggedOut ? '已安全退出。' : '',
+      error: req.query.locked === '1' ? '尝试过于频繁，账号已临时锁定，请稍后再试。' : '',
+    })
+  );
+});
+
+// 第一步：用户名 + 密码 + Turnstile
+app.post('/login', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
+  const { username = '', password = '' } = req.body;
+  const ip = req.ip || '';
+  const ipUsername = String(username || '').trim().toLowerCase();
+
+  const lock = loginLocked(ip, ipUsername);
+  if (lock.locked) {
+    return res.redirect('/?locked=1');
+  }
+
+  const ts = await verifyTurnstile(req.body['cf-turnstile-response'], ip, 'login');
+  if (!ts.ok) {
+    return res.status(400).send(
+      pages.loginPage({
+        csrf: req.session.csrf_token,
+        username,
+        error: '人机验证未通过，请重试。' + (config.env === 'development' ? ` (${ts.reason})` : ''),
+      })
+    );
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(ipUsername);
+  const hash = user ? user.password_hash : DUMMY_HASH;
+  const match = await bcrypt.compare(String(password), hash);
+
+  if (!user || !match) {
+    recordLoginFail(ip, ipUsername);
+    const after = loginLocked(ip, ipUsername);
+    return res.status(401).send(
+      pages.loginPage({
+        csrf: req.session.csrf_token,
+        username,
+        error: after.locked
+          ? '尝试过于频繁，账号已临时锁定，请 10 分钟后再试。'
+          : `用户名或密码不正确（剩余 ${after.remaining} 次尝试）。`,
+      })
+    );
+  }
+
+  clearLoginFails(ip, ipUsername);
+  const state = user.totp_enabled ? 'pending_2fa' : 'setup_2fa';
+  req.session = rotateSession(req.session.id, { userId: user.id, state });
+  setSessionCookie(res, req.session.id);
+  res.redirect(state === 'pending_2fa' ? '/2fa' : '/setup-2fa');
+});
+
+// 第二步：动态口令
+app.get('/2fa', (req, res) => {
+  if (req.session.state !== 'pending_2fa' || !req.session.user) return res.redirect('/');
+  res.send(
+    pages.twofaPage({
+      csrf: req.session.csrf_token,
+      username: req.session.user.username,
+    })
+  );
+});
+
+app.post('/2fa', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
+  const s = req.session;
+  // 重复提交（网络抖动引发浏览器重试）：已认证则直接续接去应用，不在站内打转
+  if (s.state === 'authed' && s.user_id) {
+    return res.redirect(ssoResumeOr(res, req, config.defaultRedirect));
+  }
+  if (s.state !== 'pending_2fa' || !s.user) return res.redirect('/');
+  const ip = req.ip || '';
+  const uname = s.user.username;
+
+  const lock = loginLocked(ip, uname);
+  if (lock.locked) return res.redirect('/?locked=1');
+
+  const input = String(req.body.totp || '').trim().toLowerCase();
+
+  const succeed = () => {
+    clearLoginFails(ip, uname);
+    db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso(), s.user.id);
+    req.session = rotateSession(s.id, { userId: s.user.id, state: 'authed' });
+    setSessionCookie(res, req.session.id);
+    res.redirect(ssoResumeOr(res, req, config.defaultRedirect));
+  };
+
+  if (verifyTotp(s.user.totp_secret, input)) {
+    return succeed();
+  }
+
+  // TOTP 未通过 → 尝试一次性恢复码（存的是 SHA-256 哈希）
+  const fresh = db.prepare('SELECT * FROM users WHERE id = ?').get(s.user.id);
+  let codes = [];
+  try {
+    codes = JSON.parse(fresh.recovery_codes || '[]');
+  } catch {}
+  const idx = Array.isArray(codes) ? codes.indexOf(hashRecovery(input)) : -1;
+  if (idx !== -1) {
+    codes.splice(idx, 1); // 用掉即作废
+    db.prepare('UPDATE users SET recovery_codes = ? WHERE id = ?').run(
+      JSON.stringify(codes),
+      fresh.id
+    );
+    return succeed();
+  }
+
+  recordLoginFail(ip, uname);
+  const after = loginLocked(ip, uname);
+  if (after.locked) {
+    destroySession(s.id);
+    clearSessionCookie(res);
+    return res.redirect('/?locked=1');
+  }
+  res.status(401).send(
+    pages.twofaPage({
+      csrf: s.csrf_token,
+      username: uname,
+      error: `动态口令不正确（剩余 ${after.remaining} 次尝试）。`,
+    })
+  );
+});
+
+// 注册
+app.get('/register', (req, res) => {
+  if (req.session.state === 'authed') return res.redirect('/dashboard');
+  res.send(pages.registerPage({ csrf: req.session.csrf_token }));
+});
+
+app.post('/register', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
+  const username = String(req.body.username || '').trim();
+  const password = String(req.body.password || '');
+  const password2 = String(req.body.password2 || '');
+  const ip = req.ip || '';
+
+  const fail = (msg, code = 400) =>
+    res.status(code).send(pages.registerPage({ csrf: req.session.csrf_token, username, error: msg }));
+
+  if (!registerAllowed(ip)) {
+    return fail('该 IP 注册过于频繁，请一小时后再试。', 429);
+  }
+
+  const ts = await verifyTurnstile(req.body['cf-turnstile-response'], ip, 'register');
+  if (!ts.ok) {
+    return fail('人机验证未通过，请重试。' + (config.env === 'development' ? ` (${ts.reason})` : ''));
+  }
+  if (!USERNAME_RE.test(username)) {
+    return fail('用户名需为 3–24 位字母、数字或下划线。');
+  }
+  if (password.length < 8 || password.length > 72) {
+    return fail('密码长度需在 8–72 位之间。');
+  }
+  if (password !== password2) {
+    return fail('两次输入的密码不一致。');
+  }
+
+  const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+  if (exists) {
+    return fail('该用户名已被使用，换一个试试。');
+  }
+
+  const hash = await bcrypt.hash(password, config.bcryptRounds);
+  const result = db
+    .prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)')
+    .run(username, hash, nowIso());
+
+  recordRegister(ip);
+  // 注册即登录，进入强制 2FA 绑定
+  req.session = rotateSession(req.session.id, {
+    userId: Number(result.lastInsertRowid),
+    state: 'setup_2fa',
+  });
+  setSessionCookie(res, req.session.id);
+  res.redirect('/setup-2fa');
+});
+
+// 强制绑定 TOTP
+app.get('/setup-2fa', async (req, res) => {
+  const s = req.session;
+  if (!s.user || !['setup_2fa', 'authed'].includes(s.state)) return res.redirect('/');
+  if (s.user.totp_enabled) return res.redirect('/dashboard');
+
+  let secret = s.user.totp_secret;
+  if (!secret) {
+    secret = generateSecret();
+    const codes = generateRecoveryCodes();
+    db.prepare('UPDATE users SET totp_secret = ?, recovery_codes = ? WHERE id = ?').run(
+      secret,
+      JSON.stringify(codes),
+      s.user.id
+    );
+    s.user.totp_secret = secret;
+    s.user.recovery_codes = JSON.stringify(codes);
+  }
+
+  let codes = [];
+  try {
+    codes = JSON.parse(s.user.recovery_codes || '[]');
+  } catch {
+    codes = [];
+  }
+  if (!Array.isArray(codes) || codes.length === 0) {
+    codes = generateRecoveryCodes();
+    db.prepare('UPDATE users SET recovery_codes = ? WHERE id = ?').run(
+      JSON.stringify(codes),
+      s.user.id
+    );
+  }
+
+  const uri = otpauthUri(secret, s.user.username, '明旸信息');
+  const qrDataUrl = await QRCode.toDataURL(uri, { margin: 1, width: 352 });
+
+  res.send(
+    pages.setup2faPage({
+      csrf: s.csrf_token,
+      qrDataUrl,
+      secret,
+      recoveryCodes: codes,
+      username: s.user.username,
+      error: req.query.e === '1' ? '口令不正确，请重试。' : '',
+    })
+  );
+});
+
+app.post('/setup-2fa', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
+  const s = req.session;
+  if (!s.user || !['setup_2fa', 'authed'].includes(s.state)) return res.redirect('/');
+  if (s.user.totp_enabled) return res.redirect('/dashboard');
+
+  if (!verifyTotp(s.user.totp_secret, req.body.totp)) {
+    return res.redirect('/setup-2fa?e=1');
+  }
+
+  // 启用：恢复码明文替换为哈希
+  let plain = [];
+  try {
+    plain = JSON.parse(s.user.recovery_codes || '[]');
+  } catch {}
+  const hashed = (Array.isArray(plain) ? plain : []).map(hashRecovery);
+  db.prepare('UPDATE users SET totp_enabled = 1, recovery_codes = ? WHERE id = ?').run(
+    JSON.stringify(hashed),
+    s.user.id
+  );
+  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso(), s.user.id);
+
+  req.session = rotateSession(s.id, { userId: s.user.id, state: 'authed' });
+  setSessionCookie(res, req.session.id);
+  // 有待续 SSO 请求则续接回客户端；否则回默认落地页（默认直接续接学桥 SSO）
+  const resume = ssoResumeOr(res, req, null);
+  res.redirect(resume || config.defaultRedirect);
+});
+
+// 本服务不设独立控制台：认证完成后一律续接回应用（默认落地），
+// 避免用户停在"登录成功"中间页成为死胡同；任何中断后刷新/回来都会自动续接。
+app.get('/dashboard', (req, res) => {
+  const s = req.session;
+  if (s.state === 'setup_2fa') return res.redirect('/setup-2fa');
+  if (s.state === 'pending_2fa') return res.redirect('/2fa');
+  if (s.state !== 'authed' || !s.user_id) return res.redirect('/');
+  res.redirect(config.defaultRedirect);
+});
+
+// 退出
+// 退出后回跳白名单（防开放重定向）：仅允许已登记的 SSO 客户端站点
+const LOGOUT_NEXT_ALLOWLIST = new Set(['https://x.mingyanginfo.com']);
+
+function safeLogoutNext(raw) {
+  try {
+    const u = new URL(raw);
+    if (LOGOUT_NEXT_ALLOWLIST.has(u.origin)) return u.toString();
+  } catch {}
+  return null;
+}
+
+app.post('/logout', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
+  destroySession(req.session.id);
+  clearSessionCookie(res);
+  res.redirect('/?bye=1');
+});
+app.get('/logout', (req, res) => {
+  destroySession(req.session.id);
+  clearSessionCookie(res);
+  // SSO 客户端退出联动：清掉本站会话后回跳客户端（白名单校验）
+  const next = safeLogoutNext(String(req.query.next || ''));
+  res.redirect(next || '/?bye=1');
+});
+
+// ---------- SSO：作为 IdP 为学桥等客户端提供登录 ----------
+
+// 引导入口：校验 client 与回调白名单；未登录先走本站登录（密码 + TOTP），已登录签发一次性票据
+app.get('/sso/authorize', (req, res) => {
+  const clientId = String(req.query.client_id || '');
+  const redirectUri = String(req.query.redirect_uri || '');
+  const state = String(req.query.state || '').slice(0, 200);
+
+  const client = db.prepare('SELECT * FROM sso_clients WHERE client_id = ?').get(clientId);
+  const allowed = client
+    ? client.redirect_uris.split(',').map((s) => s.trim()).filter(Boolean)
+    : [];
+  if (!client || !allowed.includes(redirectUri)) {
+    return res.status(400).send(
+      pages.messagePage({
+        title: '请求无效',
+        kicker: 'SSO / 400',
+        message: '登录请求无效：client_id 或回调地址不在白名单内。',
+      })
+    );
+  }
+
+  const s = req.session;
+  if (s.state !== 'authed' || !s.user_id) {
+    // 记录待续请求（1 小时有效，覆盖注册 + 绑定 2FA 的耗时），登录成功后自动回到本端点
+    const pending = JSON.stringify({ client_id: clientId, redirect_uri: redirectUri, state });
+    res.append(
+      'Set-Cookie',
+      `${SSO_PENDING_COOKIE}=${encodeURIComponent(pending)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600${config.session.secure ? '; Secure' : ''}`
+    );
+    return res.redirect('/');
+  }
+
+  // 签发 60 秒一次性票据并回跳客户端
+  const ticket = crypto.randomBytes(32).toString('hex');
+  const expires = new Date(Date.now() + 60 * 1000).toISOString();
+  db.prepare(
+    'INSERT INTO sso_tickets (ticket, client_id, user_id, redirect_uri, expires_at, used) VALUES (?, ?, ?, ?, ?, 0)'
+  ).run(ticket, clientId, s.user_id, redirectUri, expires);
+
+  const u = new URL(redirectUri);
+  u.searchParams.set('ticket', ticket);
+  if (state) u.searchParams.set('state', state);
+  res.redirect(u.toString());
+});
+
+// 服务端换身份（客户端 → 本服务，不经浏览器；失败一律 401 不区分原因）
+app.post('/sso/verify', express.json({ limit: '4kb' }), (req, res) => {
+  const ip = req.ip || '';
+  const body = req.body || {};
+  const clientId = String(body.client_id || '');
+  const secret = String(body.client_secret || '');
+  const ticket = String(body.ticket || '');
+
+  const rateKey = `sso:${clientId}`;
+  if (loginLocked(ip, rateKey).locked) {
+    return res.status(429).json({ error: 'rate-limited' });
+  }
+  const deny = () => {
+    recordLoginFail(ip, rateKey);
+    return res.status(401).json({ error: 'invalid' });
+  };
+
+  const client = db.prepare('SELECT * FROM sso_clients WHERE client_id = ?').get(clientId);
+  if (!client) return deny();
+
+  const given = crypto.createHash('sha256').update(secret).digest('hex');
+  const stored = client.client_secret_hash || '';
+  const secretOk =
+    given.length === stored.length &&
+    crypto.timingSafeEqual(Buffer.from(given), Buffer.from(stored));
+  if (!secretOk) return deny();
+
+  const t = db.prepare('SELECT * FROM sso_tickets WHERE ticket = ?').get(ticket);
+  if (!t || t.client_id !== clientId || t.used || t.expires_at < nowIso()) return deny();
+
+  const upd = db.prepare('UPDATE sso_tickets SET used = 1 WHERE ticket = ? AND used = 0').run(ticket);
+  if (upd.changes !== 1) return deny();
+
+  const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(t.user_id);
+  if (!user) return deny();
+
+  clearLoginFails(ip, rateKey);
+  res.json({ sub: String(user.id), username: user.username, displayName: user.username });
+});
+
+// 404 / 500
+app.use((req, res) => {
+  res.status(404).send(
+    pages.messagePage({
+      title: '页面不存在',
+      kicker: '404 / NOT FOUND',
+      message: '你访问的页面不存在或已被移动。',
+    })
+  );
+});
+app.use((err, req, res, next) => {
+  console.error('[loginapp] error:', err);
+  if (res.headersSent) return next(err);
+  res.status(500).send(
+    pages.messagePage({
+      title: '服务暂时不可用',
+      kicker: '500 / ERROR',
+      message: '服务器开小差了，请稍后再试。',
+    })
+  );
+});
+
+// 会话/限频窗口定期清理
+setInterval(cleanupExpiredSessions, 30 * 60 * 1000).unref();
+
+app.listen(config.port, '127.0.0.1', () => {
+  const ts = config.turnstile.live ? 'LIVE' : 'TEST';
+  console.log(`[loginapp] listening on 127.0.0.1:${config.port} (env=${config.env}, turnstile=${ts})`);
+  if (!config.turnstile.live && process.env.TURNSTILE_SITE_KEY) {
+    console.warn('[loginapp] TURNSTILE_SITE_KEY 已配置但 secret 未填（占位符），已回退测试密钥。请编辑 /etc/loginapp.env 填入 TURNSTILE_SECRET_KEY。');
+  }
+});

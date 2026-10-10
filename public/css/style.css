@@ -1,0 +1,407 @@
+/* ============================================================
+   明旸信息 设计系统 — 登录站点复刻版
+   依据 01-DESIGN_SPEC.md：暗色默认、CSS 变量、品牌蓝唯一 accent、
+   mono 小标签、2px 方角按钮、发丝边框、玻璃表单卡。
+   ============================================================ */
+
+/* ---------- 字体（自托管 @fontsource，禁止运行时 Google Fonts） ---------- */
+@font-face {
+  font-family: 'Noto Serif SC';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/noto-serif-sc-latin-600-normal.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+2000-206F, U+20AC, U+2122, U+2212, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Noto Serif SC';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/noto-serif-sc-chinese-simplified-600-normal.woff2') format('woff2');
+  unicode-range: U+2E80-2EFF, U+3000-303F, U+3100-312F, U+31C0-31EF, U+3400-4DBF, U+4E00-9FFF, U+F900-FAFF, U+FF00-FFEF;
+}
+@font-face {
+  font-family: 'Noto Serif SC';
+  font-style: normal;
+  font-weight: 900;
+  font-display: swap;
+  src: url('/fonts/noto-serif-sc-chinese-simplified-900-normal.woff2') format('woff2');
+  unicode-range: U+2E80-2EFF, U+3000-303F, U+3100-312F, U+31C0-31EF, U+3400-4DBF, U+4E00-9FFF, U+F900-FAFF, U+FF00-FFEF;
+}
+@font-face {
+  font-family: 'Instrument Serif';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/instrument-serif-latin-400-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Instrument Serif';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/instrument-serif-latin-400-italic.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/ibm-plex-mono-latin-400-normal.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/ibm-plex-mono-latin-500-normal.woff2') format('woff2');
+}
+
+/* ---------- 主题变量（规范 §3） ---------- */
+:root {
+  --bg: #0a0a0c;
+  --fg: #eceae4;
+  --mute: #90909a;
+  --dim: #5a5a63;
+  --surface: #1d1d23;
+  --line: rgb(236 234 228 / .08);
+  --line-strong: rgb(236 234 228 / .18);
+  --accent: #1d67ea;
+  --accent-soft: #6ea8ff;
+  --err: #e5484d;
+  --card-shadow: 0 28px 90px rgb(0 0 0 / .34);
+  --glass-bg: rgb(10 10 12 / .55);
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --font-serifcn: 'Noto Serif SC', 'Songti SC', 'SimSun', serif;
+  --font-serif: 'Instrument Serif', Georgia, serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+}
+html.light {
+  --bg: #f4f1ea;
+  --fg: #17171b;
+  --mute: #63636b;
+  --dim: #9a9aa1;
+  --surface: #e7e3d9;
+  --line: rgb(23 23 27 / .1);
+  --line-strong: rgb(23 23 27 / .24);
+  --accent: #1d67ea;
+  --accent-soft: #1a5adf;
+  --card-shadow: 0 28px 90px rgb(23 23 27 / .14);
+  --glass-bg: rgb(244 241 234 / .62);
+}
+
+/* ---------- 基础 ---------- */
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  font-size: 14.5px;
+  line-height: 1.8;
+  transition: background-color .6s ease, color .6s ease;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+::selection { background: var(--accent); color: #fff; }
+a { color: inherit; text-decoration: none; }
+p { margin: 0; }
+
+/* ---------- 氛围（规范 §6，克制） ---------- */
+.grain {
+  position: fixed; inset: 0; z-index: 60; pointer-events: none; opacity: .32;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E");
+}
+html.light .grain { opacity: .5; }
+.bg-grid {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background-image:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+  background-size: 72px 72px;
+  -webkit-mask-image: radial-gradient(ellipse 90% 70% at 50% 38%, black 26%, transparent 78%);
+          mask-image: radial-gradient(ellipse 90% 70% at 50% 38%, black 26%, transparent 78%);
+}
+.ambient {
+  position: fixed; top: -160px; right: -140px; z-index: 0; pointer-events: none;
+  width: 560px; height: 560px; border-radius: 50%;
+  background: var(--accent); filter: blur(110px); opacity: .1;
+}
+
+/* ---------- 头部与品牌锁屏（规范 §9） ---------- */
+.site-head {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 10;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 26px 40px;
+}
+.brand { display: inline-flex; align-items: center; gap: 12px; }
+.brand img { display: block; width: 30px; height: 30px; }
+.brand-text { display: flex; flex-direction: column; line-height: 1.25; }
+.brand-name { font-family: var(--font-serifcn); font-weight: 600; font-size: 17px; color: var(--fg); }
+.brand-mono { font-family: var(--font-mono); font-size: 10px; letter-spacing: .34em; color: var(--dim); }
+.theme-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 40px; height: 40px; padding: 0;
+  background: transparent; color: var(--mute);
+  border: 1px solid var(--line); border-radius: 10px;
+  cursor: pointer;
+  transition: color .3s var(--ease), border-color .3s var(--ease), transform .3s var(--ease);
+}
+.theme-btn:hover { color: var(--fg); border-color: var(--line-strong); transform: translateY(-2px); }
+.theme-btn .icon-moon { display: none; }
+html.light .theme-btn .icon-moon { display: block; }
+html.light .theme-btn .icon-sun { display: none; }
+
+/* ---------- 中央布局 ---------- */
+.auth-wrap {
+  position: relative; z-index: 1;
+  min-height: 100dvh;
+  display: flex; align-items: center; justify-content: center;
+  padding: 110px 24px 90px;
+}
+.site-foot {
+  position: absolute; bottom: 22px; left: 0; right: 0; z-index: 1;
+  text-align: center;
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: .22em; color: var(--dim);
+  padding: 0 16px; line-height: 2;
+}
+.site-foot .beian-link { color: var(--dim); transition: color .3s var(--ease); }
+.site-foot .beian-link:hover { color: var(--accent-soft); }
+
+/* ---------- 表单卡（规范 §5：玻璃卡 + 发丝边框 + 大阴影，≤420px 居中） ---------- */
+.form-card {
+  width: min(420px, 100%);
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(18px) saturate(1.15);
+          backdrop-filter: blur(18px) saturate(1.15);
+  box-shadow: var(--card-shadow);
+  padding: 42px 38px 36px;
+}
+.form-card-wide { width: min(520px, 100%); }
+
+.kicker {
+  font-family: var(--font-mono); font-size: 10.5px;
+  letter-spacing: .3em; text-transform: uppercase; color: var(--dim);
+  margin-bottom: 14px;
+}
+.form-title {
+  margin: 0 0 10px;
+  font-family: var(--font-serifcn); font-weight: 600;
+  font-size: 30px; line-height: 1.3; color: var(--fg);
+}
+.latin-accent {
+  font-family: var(--font-serif); font-style: italic; font-weight: 400;
+  font-size: .62em; color: var(--mute); margin-left: 2px;
+}
+.form-sub { font-size: 13.5px; line-height: 1.9; color: var(--mute); margin-bottom: 26px; }
+
+/* ---------- 表单控件（规范 §5：方角、发丝边、focus 蓝 ring） ---------- */
+.field { margin-bottom: 18px; }
+.field label, .field-label {
+  display: block;
+  font-family: var(--font-mono); font-size: 10.5px;
+  letter-spacing: .3em; text-transform: uppercase; color: var(--dim);
+  margin-bottom: 8px;
+}
+.field input {
+  width: 100%;
+  padding: 12px 14px;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--fg);
+  font-family: var(--font-sans); font-size: 14.5px;
+  caret-color: var(--accent);
+  transition: border-color .3s var(--ease), box-shadow .3s var(--ease);
+}
+.field input::placeholder { color: var(--dim); }
+.field input:focus {
+  outline: none;
+  border-color: var(--accent-soft);
+  box-shadow: 0 0 0 3px rgb(29 103 234 / .15);
+}
+.hint {
+  margin-top: 6px;
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: .04em;
+  color: var(--dim);
+}
+.otp-input {
+  font-family: var(--font-mono) !important;
+  font-size: 22px !important;
+  letter-spacing: .45em; text-indent: .45em;
+  text-align: center;
+}
+
+.form-error {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: .05em;
+  color: var(--err);
+  border: 1px solid rgb(229 72 77 / .3); border-radius: 2px;
+  background: rgb(229 72 77 / .06);
+  padding: 10px 12px; margin-bottom: 16px;
+  line-height: 1.7;
+}
+.form-notice {
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: .05em;
+  color: var(--accent-soft);
+  border: 1px solid rgb(29 103 234 / .3); border-radius: 2px;
+  background: rgb(29 103 234 / .07);
+  padding: 10px 12px; margin-bottom: 16px; line-height: 1.7;
+}
+.form-foot { margin-top: 24px; font-size: 13px; color: var(--mute); }
+.form-foot a { color: var(--fg); }
+
+/* ---------- 按钮（规范 §5：2px 方角、mono、hover 上浮） ---------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  font-family: var(--font-mono); font-size: 13px; letter-spacing: .08em;
+  border-radius: 2px; padding: 13px 22px; border: 1px solid transparent;
+  cursor: pointer; text-align: center;
+  transition: transform .3s var(--ease), background-color .3s var(--ease),
+              border-color .3s var(--ease), box-shadow .3s var(--ease), color .3s var(--ease);
+}
+.btn:hover { transform: translateY(-2px); }
+.btn:active { transform: translateY(0); }
+.btn-block { width: 100%; margin-top: 4px; }
+.btn-primary {
+  background: var(--accent); color: #fff;
+}
+.btn-primary:hover {
+  background: var(--accent-soft);
+  box-shadow: 0 10px 34px rgb(29 103 234 / .35);
+}
+.btn-ghost {
+  background: transparent; color: var(--fg); border-color: var(--line-strong);
+}
+.btn-ghost:hover {
+  border-color: rgb(110 168 255 / .55);
+  box-shadow: inset 0 0 14px rgb(29 103 234 / .08);
+}
+.btn:focus-visible, a:focus-visible, .theme-btn:focus-visible, .field input:focus-visible {
+  outline: 2px solid var(--accent-soft); outline-offset: 2px;
+}
+
+/* Turnstile 容器 */
+.turnstile-wrap { margin: 4px 0 18px; min-height: 65px; }
+
+/* ---------- 链接下划线滑入（规范 §8） ---------- */
+.link-slide {
+  position: relative; color: var(--fg);
+  background-image: linear-gradient(currentColor, currentColor);
+  background-repeat: no-repeat; background-position: left bottom;
+  background-size: 0% 1px;
+  transition: background-size .35s var(--ease), color .3s var(--ease);
+}
+.link-slide:hover { color: var(--accent-soft); background-size: 100% 1px; }
+
+/* ---------- 2FA 绑定页 ---------- */
+.qr-panel {
+  display: flex; align-items: center; gap: 22px;
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 18px; margin-bottom: 18px;
+}
+.qr {
+  width: 176px; height: 176px; flex: none;
+  border-radius: 6px; background: #fff; padding: 8px;
+}
+.qr-meta { min-width: 0; }
+.secret-text {
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: .1em;
+  color: var(--mute); word-break: break-all; line-height: 1.7;
+  margin-bottom: 10px;
+}
+.recovery { margin-bottom: 22px; }
+.recovery-codes {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
+}
+.recovery-codes span {
+  font-family: var(--font-mono); font-size: 12px; letter-spacing: .06em;
+  color: var(--fg);
+  border: 1px dashed var(--line-strong); border-radius: 2px;
+  padding: 7px 10px; text-align: center;
+}
+
+/* ---------- 控制台 ---------- */
+.dash { position: relative; width: min(720px, 100%); padding-bottom: 40px; }
+.dash-title {
+  margin: 0 0 12px;
+  font-family: var(--font-serifcn); font-weight: 900;
+  font-size: clamp(2.4rem, 6vw, 4rem); line-height: 1.18; color: var(--fg);
+}
+.dash-name {
+  background-image: linear-gradient(var(--accent-soft), var(--accent-soft));
+  background-repeat: no-repeat; background-position: left 88%;
+  background-size: 100% 2px; padding-bottom: 2px;
+}
+.dash .form-sub { margin-bottom: 28px; }
+.dash-meta { display: flex; flex-direction: column; gap: 18px; margin-bottom: 34px; }
+.badge-ok {
+  display: inline-flex; align-self: flex-start;
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .24em;
+  color: var(--accent-soft);
+  border: 1px solid rgb(29 103 234 / .4); border-radius: 2px;
+  padding: 5px 10px;
+}
+.meta-rows { display: flex; flex-direction: column; border-top: 1px solid var(--line); }
+.meta-rows p {
+  display: flex; justify-content: space-between; gap: 16px;
+  padding: 12px 2px; border-bottom: 1px solid var(--line);
+}
+.meta-label {
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .28em;
+  text-transform: uppercase; color: var(--dim);
+}
+.meta-value { font-family: var(--font-mono); font-size: 12.5px; color: var(--fg); text-align: right; word-break: break-all; }
+.text-outline {
+  position: absolute; right: -10px; bottom: -30px; z-index: -1;
+  font-family: var(--font-serifcn); font-weight: 900;
+  font-size: clamp(6rem, 16vw, 11rem); line-height: 1;
+  color: transparent;
+  -webkit-text-stroke: 1px var(--line-strong);
+  pointer-events: none; user-select: none;
+}
+
+/* ---------- 动效（规范 §8） ---------- */
+.rise { animation: rise .9s var(--ease) both; }
+.rise-2 { animation-delay: .08s; }
+.rise-3 { animation-delay: .16s; }
+.rise-4 { animation-delay: .24s; }
+.rise-5 { animation-delay: .32s; }
+@keyframes rise {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: none; }
+}
+.reveal {
+  animation: rise 1.15s var(--ease) both;
+  animation-timeline: view();
+  animation-range: entry 0% entry 40%;
+}
+
+/* ---------- 响应式 ---------- */
+@media (max-width: 640px) {
+  .site-head { padding: 18px 20px; }
+  .form-card { padding: 32px 24px 28px; }
+  .auth-wrap { padding: 96px 18px 84px; }
+  .qr-panel { flex-direction: column; align-items: flex-start; }
+  .text-outline { display: none; }
+  .site-foot { font-size: 9px; letter-spacing: .14em; }
+}
+
+/* ---------- 亮色模式纹理适配 ---------- */
+html.light .ambient { opacity: .13; }
+html.light .bg-grid { opacity: .9; }
+
+/* ---------- 减少动效（规范 §8 必须保留） ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

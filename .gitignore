@@ -1,0 +1,17 @@
+# 依赖
+node_modules/
+
+# 密钥与运行时数据（真实配置在 /etc/loginapp.env 与 /var/lib/loginapp/，均在本目录之外）
+.env
+.env.*
+*.db
+*.sqlite*
+*.log
+*.pem
+*.key
+
+# ACME 证书验证目录（运行时生成）
+.well-known/
+
+# 杂项
+.DS_Store
