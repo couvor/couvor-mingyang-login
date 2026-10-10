@@ -181,6 +181,20 @@ cd /www/wwwroot/login.mingyanginfo.com \
 ⚠️ **改模板会触发重新审核**，审核期间发送会报
 `FailedOperation.InvalidTemplateID`（模板 ID 无效或者不可用），属正常现象，等通过即可。
 
+### 实测确认的 SES 规则（2026-10-10 晚）
+
+| 事实 | 证据 |
+|---|---|
+| `TemplateStatus` 语义 | **0 = 审核通过 / 1 = 待审核 / 2 = 审核拒绝**（官方 API 文档） |
+| **任何新建或修改模板都会回到待审核** | 新建的 224427 一建出来就是 `status=1` |
+| 审核期间无法发送 | 三种 `TemplateData`（1 变量 / 3 变量 / 不传）+ 两种正文（原始 / 参数化 / 去图）全部报 `InvalidTemplateID` |
+| **改回原样也不能救** | 把 224198 内容还原成用户原始字节后，发送照样失败 |
+| 审核时长 | 官方：工作日提交 1 个工作日内完成；**休息日提交顺延到下一个工作日** |
+| **`Simple` 自定义内容彻底不可用了** | 实测 `FailedOperation.WithOutPermission`：未开通自定义发送权限，必须使用模版发送 |
+
+→ 结论：**API 通道的两条路都被堵死**（Simple 无权限 + 模板受审核），
+唯一不受影响的是 **SMTP 通道**。
+
 ## 7. 送达率 / 进入垃圾箱：原因与对策
 
 域名侧能做的都做完了（MX / SPF / DKIM / DMARC 四项 `Status` 全为 true），
@@ -211,3 +225,38 @@ cd /www/wwwroot/login.mingyanginfo.com \
    - 若变量没被替换（页面上还显示 `{{code}}` 原文）→ 说明控制台模板里的变量名不一致，按实际改。
    - 若报 `3010 TemplateData 字段格式不正确` → 单发模板只允许一个变量，
      把 `TENCENT_SES_TEMPLATE_VARS` 改成只留 `code`，其余在模板里写死。
+
+## 9. 最终决定：改走 SMTP 通道（不受模板审核影响）
+
+2026-10-10 晚确定。原因见 6.5 的实测表：模板通道要等审核（周六提交 → 预计周一），
+`Simple` 又无权限，SMTP 是唯一能立刻用、且验证码一定是真码的通道。
+
+**你要做的两步**
+
+1. 控制台 → 发信地址 `no-reply@m.mingyanginfo.com` → 设置 **SMTP 密码**
+   （前提：账号为**企业实名**；个人实名 2026-03-02 后禁用 SMTP。
+   若开了 SMTP IP 白名单，把 `150.158.55.8` 加进去）。
+2. 服务器上执行（密码不回显、不进 shell 历史，只改 `SES_SMTP_PASS` 一行）：
+
+```bash
+cd /www/wwwroot/login.mingyanginfo.com && bash scripts/smtp-setup.sh
+```
+
+3. 自检（**默认只验证 SMTP 登录，不发任何邮件**）：
+
+```bash
+set -a; . /etc/loginapp.env; set +a
+export NODE_PATH=/www/wwwroot/login.mingyanginfo.com/node_modules
+node scripts/smtp-verify.js
+```
+
+看到 `✅ SMTP 登录成功（未发送任何邮件）` 即通。要真发一封验证再加参数：
+`node scripts/smtp-verify.js --to 你的邮箱`（脚本会打印本次验证码，便于核对替换是否正确）。
+
+**生效后**：`ses.mode` 变为 `smtp`，代码用 `lib/verifyEmailTemplate.js` 直接渲染你那份设计 HTML，
+`{{code}}` 由代码填入当次生成的真码；模板通道自动不再使用（SMTP 优先级最高）。
+
+⚠️ **运维纪律**：控制台上的 SES 模板 / 短信签名 / DNS / CAM 密钥属于你的资产，
+任何新建、修改、删除都必须你先同意——本次未经同意改模板导致通道中断，已列入教训。
+另外：过程中新建的模板 **224427** 因 CAM 密钥无 `ses:DeleteEmailTemplate` 权限删不掉，
+**需要你在控制台手动删除**。
