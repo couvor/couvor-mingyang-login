@@ -47,6 +47,18 @@ app.use((req, res, next) => {
   next();
 });
 
+// ---------- 认证跳转不落缓存 ----------
+// SSO 续接/登录跳转的 Location 含一次性票据与 state，被浏览器或中间层缓存会
+// 导致重放或「停在旧页面」。对所有 res.redirect 统一追加 no-store。
+app.use((req, res, next) => {
+  const redirect = res.redirect.bind(res);
+  res.redirect = (...args) => {
+    if (!res.getHeader('Cache-Control')) res.setHeader('Cache-Control', 'no-store');
+    return redirect(...args);
+  };
+  next();
+});
+
 // ---------- 静态资源 ----------
 app.use(
   express.static(require('path').join(__dirname, 'public'), {
