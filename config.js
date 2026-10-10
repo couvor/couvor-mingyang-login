@@ -2,6 +2,41 @@
 
 const path = require('path');
 
+// 腾讯云服务配置（SES 邮件推送 + SMS 短信），供下方 tencent 与 mfa 共用，避免对象字面量内部自引用。
+// 密钥与资源 ID 一律从环境变量（/etc/loginapp.env）读取，绝不写入代码或日志。
+function buildTencent() {
+  const secretId = (process.env.TENCENT_SECRET_ID || '').trim();
+  const secretKey = (process.env.TENCENT_SECRET_KEY || '').trim();
+  const smsSdkAppId = (process.env.TENCENT_SMS_SDK_APP_ID || '').trim();
+  const smsSign = (process.env.TENCENT_SMS_SIGN || '').trim();
+  const smsTemplateId = (process.env.TENCENT_SMS_TEMPLATE_ID || '').trim();
+  const sesFromAddress = (process.env.TENCENT_SES_FROM_ADDRESS || '').trim();
+
+  const hasCredential = !!secretId && !!secretKey;
+  // 短信要齐全（应用、签名、模板）才视为可用
+  const smsConfigured = hasCredential && !!smsSdkAppId && !!smsSign && !!smsTemplateId;
+  // 邮件只需发信地址（仍需在控制台完成验证/认证，否则 SendEmail 会报 NoSuchSender）
+  const sesConfigured = hasCredential && !!sesFromAddress;
+
+  return {
+    secretId,
+    secretKey,
+    sms: {
+      sdkAppId: smsSdkAppId,
+      signName: smsSign,
+      templateId: smsTemplateId,
+      region: (process.env.TENCENT_SMS_REGION || 'ap-guangzhou').trim(),
+      configured: smsConfigured,
+    },
+    ses: {
+      fromAddress: sesFromAddress,
+      region: (process.env.TENCENT_SES_REGION || 'ap-hongkong').trim(),
+      configured: sesConfigured,
+    },
+  };
+}
+const tencentCfg = buildTencent();
+
 module.exports = {
   port: parseInt(process.env.PORT || '3000', 10),
   env: process.env.NODE_ENV || 'development',
@@ -47,21 +82,25 @@ module.exports = {
     secure: process.env.COOKIE_SECURE === '1', // HTTPS 上线后设为 1
   },
 
+  // 腾讯云服务（用于发送 MFA 验证码）：邮件推送 SES + 短信 SMS。
+  // 密钥与资源 ID 一律从 /etc/loginapp.env 读取（见 buildTencent / README-DELIVERY.md 第六节）。
+  tencent: tencentCfg,
+
   // 多因素认证（MFA）：TOTP / 邮箱 / 手机 三选一。
-  // 邮箱与手机方式依赖外部服务商（由 lib/notify.js 真实发送验证码）：
+  // 邮箱与手机方式依赖外部服务商（腾讯云 SES/SMS，由 lib/notify.js 真实发送验证码）：
   //   - 开发/测试（NODE_ENV=development 或 MOCK_2FA=1）下始终可用，验证码仅打印到服务端控制台；
-  //   - 生产环境仅在配置了对应服务商后才开放，避免用户选了却收不到码而被锁死。
-  // 相关环境变量（/etc/loginapp.env）：SMTP_HOST 或 EMAIL_PROVIDER_KEY（邮箱），SMS_PROVIDER_KEY（短信）。
+  //   - 生产环境仅在配置了对应腾讯云服务后才开放，避免用户选了却收不到码而被锁死。
   mfa: (() => {
     const isDevEnv =
       (process.env.NODE_ENV || 'development') === 'development' || process.env.MOCK_2FA === '1';
-    const emailProvider = !!(process.env.SMTP_HOST || process.env.EMAIL_PROVIDER_KEY);
-    const smsProvider = !!(process.env.SMS_PROVIDER_KEY);
     return {
       codeTtlMs: 10 * 60 * 1000, // 验证码 10 分钟有效
-      emailEnabled: isDevEnv || emailProvider,
-      phoneEnabled: isDevEnv || smsProvider,
-      providers: { email: emailProvider, sms: smsProvider },
+      emailEnabled: isDevEnv || tencentCfg.ses.configured,
+      phoneEnabled: isDevEnv || tencentCfg.sms.configured,
+      providers: {
+        email: tencentCfg.ses.configured,
+        sms: tencentCfg.sms.configured,
+      },
     };
   })(),
 

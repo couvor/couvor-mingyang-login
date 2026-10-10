@@ -86,11 +86,47 @@ systemctl restart loginapp         # 改配置后重启
 - 目标脱敏展示：邮箱 `u***@domain`、手机 `139****0001`。
 - **开发/测试回显**：`NODE_ENV=development` 或 `MOCK_2FA=1` 时验证码打印到服务端控制台，
   并在页面上回显（`code-echo`），便于本地走通流程；生产环境不回显。
-- **生产必须接入服务商**（`lib/notify.js` 内的 TODO）：未配置时**自动关闭**邮箱 / 手机方式，
-  选择页仅开放 TOTP，避免用户选了却收不到码被锁死。需要时在 `/etc/loginapp.env` 补：
-  - 邮箱：`SMTP_HOST`（或 `EMAIL_PROVIDER_KEY`）
-  - 短信：`SMS_PROVIDER_KEY`
-  - 临时强制在非生产环境外发/回显：`MOCK_2FA=1`（仅联调用，勿长期开启）
+### 6.1 腾讯云邮件（SES 邮件推送）与短信（SMS）接入（2026-10-10）
+
+邮箱验证码走腾讯云 **SES 邮件推送** `SendEmail`（Simple，HTML/Text 均 base64 编码），
+手机验证码走腾讯云 **SMS 短信** `SendSms`。SDK 为官方模块化包，已在 `package.json` 中声明：
+
+```
+tencentcloud-sdk-nodejs-ses
+tencentcloud-sdk-nodejs-sms
+```
+
+**控制台准备（一次性）**
+
+- 短信 SMS：开通「短信」→ 创建应用拿到 `SdkAppId` → 申请**签名**（如「明旸信息」，需资质审核）
+  → 申请**验证码类模板**拿到 `TemplateId`，模板含 `{1}` 验证码、`{2}` 有效分钟数
+  → 购买套餐包（国内验证码短信需实名套餐）。
+- 邮件 SES：开通「邮件推送」→ 添加并**验证发信域名 / 发信地址**（`noreply@mail.mingyanginfo.com`）
+  → 按指引配置 SPF、DKIM（未验证将报错 `NoSuchSender`）。
+- 密钥：在访问管理 CAM 创建子账号密钥 `SecretId` / `SecretKey`，**仅授予** `QcloudSMSFullAccess`
+  与 SES 发信相关策略，不要用主账号密钥。
+
+**环境变量（`/etc/loginapp.env`，写入后 `systemctl restart loginapp`）**
+
+| 变量 | 说明 | 示例 |
+| --- | --- | --- |
+| `TENCENT_SECRET_ID` / `TENCENT_SECRET_KEY` | CAM API 密钥（SES 与 SMS 共用） | `AKIDxxxx` |
+| `TENCENT_SMS_SDK_APP_ID` | 短信应用 SdkAppId | `1400000000` |
+| `TENCENT_SMS_SIGN` | 短信**签名内容**（非签名 ID） | `明旸信息` |
+| `TENCENT_SMS_TEMPLATE_ID` | 验证码模板 ID | `123456` |
+| `TENCENT_SMS_TEMPLATE_PARAMS` | 可选，模板参数顺序，默认 `CODE,MINUTES` | `CODE,MINUTES` |
+| `TENCENT_SMS_REGION` | 短信地域，默认 `ap-guangzhou` | `ap-guangzhou` |
+| `TENCENT_SES_FROM_ADDRESS` | 已验证的发信地址 | `noreply@mail.mingyanginfo.com` |
+| `TENCENT_SES_REGION` | SES 地域，默认 `ap-hongkong`（国内站常用 `ap-guangzhou`） | `ap-hongkong` |
+
+**开关与降级行为**
+
+- 短信需**密钥 + SdkAppId + 签名 + 模板**齐全才视为已配置；邮件需**密钥 + 发信地址**。
+- 未配置时对应方式**在选择页自动关闭**（只留 TOTP），用户不会选到收不到码的方式而被锁死。
+- 已配置但调用失败（额度耗尽、模板审核未过、发信地址未验证等）时：
+  打印错误日志并在页面提示「验证码发送失败」，**不会**假装已发送。
+- 开发/测试环境（`NODE_ENV=development` 或 `MOCK_2FA=1`）始终走 **mock**：只打印到控制台并在页面回显，
+  **绝不真实外发**，不会消耗短信套餐。
 
 ## 七、安全机制备忘
 
