@@ -5,12 +5,18 @@ const path = require('path');
 // 腾讯云服务配置（SES 邮件推送 + SMS 短信），供下方 tencent 与 mfa 共用，避免对象字面量内部自引用。
 // 密钥与资源 ID 一律从环境变量（/etc/loginapp.env）读取，绝不写入代码或日志。
 function buildTencent() {
-  const secretId = (process.env.TENCENT_SECRET_ID || '').trim();
-  const secretKey = (process.env.TENCENT_SECRET_KEY || '').trim();
-  const smsSdkAppId = (process.env.TENCENT_SMS_SDK_APP_ID || '').trim();
-  const smsSign = (process.env.TENCENT_SMS_SIGN || '').trim();
-  const smsTemplateId = (process.env.TENCENT_SMS_TEMPLATE_ID || '').trim();
-  const sesFromAddress = (process.env.TENCENT_SES_FROM_ADDRESS || '').trim();
+  // 统一取值：空值与 __REPLACE_ME__ 占位符一律视为"未配置"。
+  // 否则"看似配好、实际发不出"会让用户被卡在手机/邮箱验证上。
+  const envVal = (k) => {
+    const v = (process.env[k] || '').trim();
+    return !v || v.includes('__REPLACE_ME__') ? '' : v;
+  };
+  const secretId = envVal('TENCENT_SECRET_ID');
+  const secretKey = envVal('TENCENT_SECRET_KEY');
+  const smsSdkAppId = envVal('TENCENT_SMS_SDK_APP_ID');
+  const smsSign = envVal('TENCENT_SMS_SIGN');
+  const smsTemplateId = envVal('TENCENT_SMS_TEMPLATE_ID');
+  const sesFromAddress = envVal('TENCENT_SES_FROM_ADDRESS');
 
   // 邮件通道二：SES 的 SMTP 发送（不需要 CAM 密钥，只需发信地址 + SMTP 密码）。
   // 腾讯云 SES 控制台「发信地址」页可看到 SMTP 服务地址与端口，并单独设置 SMTP 密码。
@@ -21,7 +27,6 @@ function buildTencent() {
   const smtpHost = (process.env.SES_SMTP_HOST || 'smtp.qcloudmail.com').trim();
   const smtpPort = parseInt(process.env.SES_SMTP_PORT || '465', 10);
   const smtpUser = (process.env.SES_SMTP_USER || sesFromAddress).trim();
-  // 密码不做 trim：首尾空格可能是密码的一部分
   // 密码不做 trim（首尾空格可能是密码的一部分）；占位符一律视为未配置，
   // 避免"看似配好、实际发不出"把用户锁在邮箱验证上。
   const smtpPassRaw = process.env.SES_SMTP_PASS || '';
