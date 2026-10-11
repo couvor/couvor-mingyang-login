@@ -18,8 +18,21 @@ const {
 } = require('./lib/ratelimit');
 const { verifyTurnstile } = require('./lib/turnstile');
 const pages = require('./lib/pages');
+const multer = require('multer');
+const avatar = require('./lib/avatar');
 
 const app = express();
+
+// 头像图片的来源域名（COS 默认域名或自定义 CDN 域名），用于放宽 CSP 的 img-src。
+// 只在真正使用 COS 存储时才放开；本地回退模式图片由本站 /avatar/… 提供，无需额外放行。
+const AVATAR_IMG_ORIGIN = (() => {
+  if (config.avatar.backend !== 'cos') return '';
+  try {
+    return new URL(config.avatar.publicBase).origin;
+  } catch {
+    return '';
+  }
+})();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
@@ -32,7 +45,7 @@ app.use((req, res, next) => {
       "base-uri 'self'",
       "form-action 'self'",
       "frame-ancestors 'none'",
-      "img-src 'self' data:",
+      `img-src 'self' data:${AVATAR_IMG_ORIGIN ? ' ' + AVATAR_IMG_ORIGIN : ''}`,
       "style-src 'self' 'unsafe-inline'",
       "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com",
       "frame-src https://challenges.cloudflare.com",
@@ -687,6 +700,121 @@ app.get('/dashboard', (req, res) => {
   res.redirect(config.defaultRedirect);
 });
 
+// ---------- 账号设置：用户自行上传 / 更换 / 移除头像 ----------
+
+// 上传解析：只走内存（后续由 sharp 处理再落存储），大小与数量双重限制。
+// nginx 侧 client_max_body_size 10m 已放宽，这里再按 5MB 收紧。
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: config.avatar.maxBytes, files: 1, fields: 8 },
+});
+
+// 失败原因码 → 用户可读提示（内部错误细节只进日志，不回显到页面）
+const AVATAR_ERRORS = {
+  nofile: '请先选择一张图片。',
+  toobig: '图片超过 5MB，请压缩后再试。',
+  type: '仅支持 JPG / PNG / WebP / GIF / AVIF 格式的图片。',
+  rate: '上传过于频繁，请稍后再试。',
+  fail: '头像上传失败，请稍后再试。',
+};
+
+function requireAuthed(req, res, next) {
+  const s = req.session;
+  if (s.state !== 'authed' || !s.user_id) return res.redirect('/');
+  next();
+}
+
+const pad2 = (n) => String(n).padStart(2, '0');
+
+// ISO 时间 → 2026.10.11 09:30（服务器时区；与站内其它页面保持一致）
+function fmtDateTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return `${d.getFullYear()}.${pad2(d.getMonth() + 1)}.${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+function accountView(req, res, { notice = '', error = '' } = {}) {
+  const s = req.session;
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(s.user_id);
+  if (!user) return res.redirect('/');
+  const method = userMfaMethod(user);
+  const mfaLabel =
+    method === 'totp' ? '动态令牌（TOTP）'
+    : method === 'email' ? '邮箱验证'
+    : method === 'phone' ? '手机验证'
+    : '未绑定';
+  res.send(
+    pages.accountPage({
+      csrf: s.csrf_token,
+      username: user.username,
+      avatarUrl: user.avatar_url || '',
+      initial: avatar.initialOf(user.username),
+      emailMasked: user.email ? mfaTarget(user, 'email') : '',
+      phoneMasked: user.phone ? mfaTarget(user, 'phone') : '',
+      mfaLabel,
+      lastLogin: fmtDateTime(user.last_login_at),
+      joined: fmtDateTime(user.created_at),
+      avatarUpdated: fmtDateTime(user.avatar_updated_at),
+      homeHref: config.defaultRedirect,
+      avatarEnabled: true,
+      notice,
+      error,
+    })
+  );
+}
+
+app.get('/account', requireAuthed, (req, res) => {
+  const ok = String(req.query.ok || '');
+  const code = String(req.query.e || '');
+  const notice = ok === '1' ? '头像已更新，已同步到接入的应用。' : ok === 'removed' ? '已移除头像。' : '';
+  accountView(req, res, { notice, error: AVATAR_ERRORS[code] || '' });
+});
+
+app.post(
+  '/account/avatar',
+  requireAuthed,
+  avatarUpload.single('avatar'),
+  csrfGuard,
+  async (req, res) => {
+    const userId = req.session.user_id;
+    try {
+      const saved = await avatar.saveAvatar(userId, req.file && req.file.buffer);
+      const prev = db.prepare('SELECT avatar_key FROM users WHERE id = ?').get(userId);
+      db.prepare(
+        'UPDATE users SET avatar_url = ?, avatar_key = ?, avatar_updated_at = ? WHERE id = ?'
+      ).run(saved.url, saved.key, nowIso(), userId);
+      // 先写新后删旧：清理失败不影响用户已换好的头像
+      avatar.removeAfterReplace(prev && prev.avatar_key);
+      res.redirect('/account?ok=1');
+    } catch (err) {
+      const code = err && err.code ? err.code : 'fail';
+      if (code === 'fail') console.error('[loginapp] 头像上传失败:', err);
+      res.redirect(`/account?e=${encodeURIComponent(code)}`);
+    }
+  }
+);
+
+app.post('/account/avatar/delete', requireAuthed, csrfGuard, (req, res) => {
+  const userId = req.session.user_id;
+  const row = db.prepare('SELECT avatar_key FROM users WHERE id = ?').get(userId);
+  db.prepare('UPDATE users SET avatar_url = NULL, avatar_key = NULL, avatar_updated_at = ? WHERE id = ?')
+    .run(nowIso(), userId);
+  avatar.removeAfterReplace(row && row.avatar_key);
+  res.redirect('/account?ok=removed');
+});
+
+// 本地回退存储的图片读取（COS 模式不会命中此路由）。
+// 文件名由服务端生成（<userId>-<24 位 hex>.webp），校验正则后读盘，杜绝路径穿越。
+app.get('/avatar/:name', async (req, res, next) => {
+  const buf = await avatar.readLocal(String(req.params.name || ''));
+  if (!buf) return next();
+  res.setHeader('Content-Type', 'image/webp');
+  res.setHeader('Cache-Control', 'public, max-age=86400');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.send(buf);
+});
+
 // 退出
 // 退出后回跳白名单（防开放重定向）：仅允许已登记的 SSO 客户端站点
 const LOGOUT_NEXT_ALLOWLIST = new Set(['https://x.mingyanginfo.com']);
@@ -791,11 +919,26 @@ app.post('/sso/verify', express.json({ limit: '4kb' }), (req, res) => {
   const upd = db.prepare('UPDATE sso_tickets SET used = 1 WHERE ticket = ? AND used = 0').run(ticket);
   if (upd.changes !== 1) return deny();
 
-  const user = db.prepare('SELECT id, username FROM users WHERE id = ?').get(t.user_id);
+  const user = db.prepare('SELECT id, username, avatar_url FROM users WHERE id = ?').get(t.user_id);
   if (!user) return deny();
 
   clearLoginFails(ip, rateKey);
-  res.json({ sub: String(user.id), username: user.username, displayName: user.username });
+  // avatarUrl 为可直接访问的绝对地址（COS 或本站 /avatar/…），无头像时为 null
+  res.json({
+    sub: String(user.id),
+    username: user.username,
+    displayName: user.username,
+    avatarUrl: user.avatar_url || null,
+  });
+});
+
+// 上传解析错误（超大文件、字段过多等）统一转成账号页提示，避免直接抛 500
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    const code = err.code === 'LIMIT_FILE_SIZE' ? 'toobig' : 'fail';
+    return res.redirect(`/account?e=${code}`);
+  }
+  return next(err);
 });
 
 // 404 / 500
@@ -826,6 +969,13 @@ setInterval(cleanupExpiredSessions, 30 * 60 * 1000).unref();
 app.listen(config.port, '127.0.0.1', () => {
   const ts = config.turnstile.live ? 'LIVE' : 'TEST';
   console.log(`[loginapp] listening on 127.0.0.1:${config.port} (env=${config.env}, turnstile=${ts})`);
+  // 只打印后端类型与桶名，绝不打印密钥
+  console.log(
+    `[loginapp] avatar storage: ${config.avatar.backend}` +
+      (config.avatar.backend === 'cos'
+        ? ` (bucket=${config.avatar.bucket}, region=${config.avatar.region})`
+        : ` (dir=${config.avatar.localDir})`)
+  );
   if (!config.turnstile.live && process.env.TURNSTILE_SITE_KEY) {
     console.warn('[loginapp] TURNSTILE_SITE_KEY 已配置但 secret 未填（占位符），已回退测试密钥。请编辑 /etc/loginapp.env 填入 TURNSTILE_SECRET_KEY。');
   }

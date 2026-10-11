@@ -171,7 +171,57 @@ read -r -s -p 'SMTP 密码: ' P \
 - 开发/测试环境（`NODE_ENV=development` 或 `MOCK_2FA=1`）始终走 **mock**：只打印到控制台并在页面回显，
   **绝不真实外发**，不会消耗短信套餐。
 
-## 七、安全机制备忘
+## 七、头像：用户自行上传（2026-10-11）
+
+用户中心 `/account`（需已登录）支持上传 / 更换 / 移除头像，头像会随 SSO 身份一并发给
+学桥等已接入的应用（`/sso/verify` 响应新增 `avatarUrl` 字段）。
+
+- **页面**：`GET /account`（头像预览 + 选择图片 + 上传 + 移除 + 账号信息 + 退出）
+- **端点**：`POST /account/avatar`（multipart，字段名 `avatar`，带 CSRF）、
+  `POST /account/avatar/delete`、`GET /avatar/:name`（仅本地回退模式提供图片）
+- **处理**：sharp 解码 → 校验真实格式（**不信任 MIME / 扩展名**，明确拒绝 SVG）→
+  按 EXIF 摆正 → 智能居中裁剪 `256 × 256` → 输出 WebP(q82)。
+  上限 5MB、输入像素 ≤ 4000 万（防解压炸弹）、每用户每小时 20 次。
+- **展示**：无头像时渲染用户名首字母占位，**不依赖任何第三方头像服务**。
+- **存储**：默认腾讯云 COS；未配置桶时自动回退服务器本地文件
+  （`/var/lib/loginapp/avatars/`，由本站 `/avatar/<userId>-<hex>.webp` 提供，
+  文件名正则校验，杜绝路径穿越）——保证存储未就绪时功能仍可用。
+- **对象键**：`avatars/<userId>/<24 位随机 hex>.webp`，随机后缀天然规避缓存旧图，
+  故可长缓存（COS 侧 `max-age=31536000`）；换头像时先写新后删旧，清理失败只记日志。
+
+**控制台准备（一次性，全部由你在腾讯云控制台完成，代码不会自动创建任何云资源）**
+
+1. 开通「对象存储 COS」→ 创建桶：**公有读私有写**、地域自选（建议 `ap-guangzhou`）。
+   桶名要带 AppId 后缀，形如 `avatar-1250000000`。
+2. 访问管理 CAM → 给使用的子账号/密钥授予该桶的 `cos:PutObject`、`cos:DeleteObject`
+   （最小权限原则；如需 `--probe` 列桶再加 `cos:GetService`）。
+   现有 `TENCENT_SECRET_ID/KEY` 目前 **无 COS 权限**（实测 `AccessDenied`），
+   需授权或另建一把专用密钥。
+3. 桶设为公有读后无需配置 CORS：上传是服务端直传，浏览器只读取图片。
+
+**环境变量（`/etc/loginapp.env`，写入后 `systemctl restart loginapp`）**
+
+| 变量 | 说明 | 示例 |
+| --- | --- | --- |
+| `COS_BUCKET` | 桶名（**含 AppId 后缀**） | `avatar-1250000000` |
+| `COS_REGION` | 桶地域，默认 `ap-guangzhou` | `ap-guangzhou` |
+| `COS_SECRET_ID` / `COS_SECRET_KEY` | 可选，头像专用密钥；未填则复用 `TENCENT_SECRET_ID/KEY` | `AKIDxxxx` |
+| `COS_PUBLIC_BASE_URL` | 可选，自定义 CDN 域名（会自动加入 CSP `img-src`） | `https://avatar.mingyanginfo.com` |
+| `AVATAR_LOCAL_DIR` | 可选，本地回退目录，默认 `/var/lib/loginapp/avatars` | — |
+
+**自检脚本（只读，不上传任何图片、不打印密钥）**
+
+```bash
+set -a; . /etc/loginapp.env; set +a
+NODE_PATH=/www/wwwroot/login.mingyanginfo.com/node_modules node scripts/check-avatar.js
+node scripts/check-avatar.js --dry-run   # 额外跑一遍裁剪压缩，输出处理前后体积
+node scripts/check-avatar.js --probe     # 额外列出账号下的 COS 桶（需 cos:GetService）
+```
+
+**依赖**：`sharp`（图像处理，含预编译二进制）、`multer`（multipart 解析）、
+`cos-nodejs-sdk-v5`（对象存储）。nginx `client_max_body_size` 现为 `10m`，大于 5MB 应用上限，无需调整。
+
+## 八、安全机制备忘
 
 - 密码 bcrypt(cost 12)；登录/二次验证同 IP+账号 5 次失败锁 10 分钟；注册同 IP 每小时限 5 次。
 - 每表单 CSRF token；session cookie HttpOnly + SameSite=Lax + Secure，登录后轮换 ID。

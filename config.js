@@ -163,4 +163,46 @@ module.exports = {
   },
 
   bcryptRounds: 12,
+
+  // 头像（用户自行上传）：默认存腾讯云 COS，未配置桶时回退服务器本地文件。
+  // 环境变量（/etc/loginapp.env，写入后 systemctl restart loginapp）：
+  //   COS_BUCKET            桶名，形如 avatar-1250000000（**必须带 AppId 后缀**）
+  //   COS_REGION            桶地域，默认 ap-guangzhou
+  //   COS_SECRET_ID / COS_SECRET_KEY   可选，默认复用 TENCENT_SECRET_ID / TENCENT_SECRET_KEY，
+  //                        建议单独给头像桶建一把最小权限密钥（只需 cos:PutObject / DeleteObject）
+  //   COS_PUBLIC_BASE_URL   可选，自定义 CDN 域名，形如 https://avatar.mingyanginfo.com
+  //   AVATAR_LOCAL_DIR      可选，回退存储目录，默认 /var/lib/loginapp/avatars
+  // 桶的创建、权限、跨域等**一律在腾讯云控制台完成**，代码不自动创建任何云资源。
+  avatar: (() => {
+    const envVal = (k) => {
+      const v = (process.env[k] || '').trim();
+      return !v || v.includes('__REPLACE_ME__') ? '' : v;
+    };
+    const bucket = envVal('COS_BUCKET');
+    const region = envVal('COS_REGION') || 'ap-guangzhou';
+    // 未单独配置时复用腾讯云通用密钥（SES / SMS 同用的一对）
+    const secretId = envVal('COS_SECRET_ID') || envVal('TENCENT_SECRET_ID');
+    const secretKey = envVal('COS_SECRET_KEY') || envVal('TENCENT_SECRET_KEY');
+    const cdnBase = envVal('COS_PUBLIC_BASE_URL').replace(/\/+$/, '');
+    const configured = !!bucket && !!secretId && !!secretKey;
+    const backend = configured ? 'cos' : 'local';
+    const publicBase =
+      backend === 'cos' ? cdnBase || `https://${bucket}.cos.${region}.myqcloud.com` : '';
+    return {
+      backend, // cos | local
+      bucket,
+      region,
+      secretId, // 机密：仅内部使用，禁止写入日志
+      secretKey, // 机密：仅内部使用，禁止写入日志
+      publicBase,
+      configured,
+      // 输出规格：统一裁剪为正方形并转 WebP，控制体积与加载速度
+      size: 256,
+      maxBytes: 5 * 1024 * 1024, // 上传上限 5MB
+      allowedFormats: ['jpeg', 'png', 'webp', 'gif', 'avif'],
+      // 每用户每小时上传次数（内存计数，重启即清零，够挡误触与脚本刷子）
+      perHourPerUser: 20,
+      localDir: envVal('AVATAR_LOCAL_DIR') || '/var/lib/loginapp/avatars',
+    };
+  })(),
 };
