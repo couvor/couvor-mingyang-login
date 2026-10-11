@@ -48,9 +48,9 @@ app.use((req, res, next) => {
       "frame-ancestors 'none'",
       `img-src 'self' data:${AVATAR_IMG_ORIGIN ? ' ' + AVATAR_IMG_ORIGIN : ''}`,
       "style-src 'self' 'unsafe-inline'",
-      "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com",
-      "frame-src https://challenges.cloudflare.com",
-      "connect-src https://challenges.cloudflare.com",
+      "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com https://www.recaptcha.net https://www.google.com https://www.gstatic.com",
+      "frame-src https://challenges.cloudflare.com https://www.recaptcha.net https://www.google.com https://www.gstatic.com",
+      "connect-src https://challenges.cloudflare.com https://www.recaptcha.net https://www.google.com https://www.gstatic.com",
       "object-src 'none'",
     ].join('; ')
   );
@@ -329,7 +329,7 @@ app.get('/2fa', async (req, res) => {
     );
   }
 
-  // 邮箱/手机：不再自动发码——必须先通过 Cloudflare Turnstile（POST /2fa/send）才会真正发送。
+  // 邮箱/手机：不再自动发码——必须先通过 Google reCAPTCHA（POST /2fa/send）才会真正发送。
   // 已有未过期验证码（刚发过或刷新页面）时直接显示输入框。
   const hasCode = mfa.hasValidCode(method, s.user.id);
   res.send(
@@ -352,11 +352,12 @@ app.post('/2fa/send', express.urlencoded({ extended: false }), csrfGuard, async 
   const method = s.mfa_method || userMfaMethod(s.user);
   if (method !== 'email' && method !== 'phone') return res.redirect('/2fa');
 
-  // 重发验证码会真实消耗邮件 / 短信资源，必须先过 Cloudflare Turnstile
+  // 发码会真实消耗邮件 / 短信资源，必须先过 Google reCAPTCHA v2（recaptcha.net），
+  // 验证通过之后才真正发送——绝不在验证前发码。
   const ip = req.ip || '';
-  const cap = await verifyTurnstile(req.body['cf-turnstile-response'], ip, '2fa-resend');
+  const cap = await verifyRecaptcha(req.body['g-recaptcha-response'], ip);
   if (!cap.ok) {
-    console.warn('[loginapp] /2fa/send Turnstile 校验失败:', cap.reason, cap.codes || '');
+    console.warn('[loginapp] /2fa/send reCAPTCHA 校验失败:', cap.reason, cap.codes || '');
     return res.redirect('/2fa?e=robot');
   }
 
@@ -521,19 +522,10 @@ app.post('/register', express.urlencoded({ extended: false }), csrfGuard, async 
     .run(username, hash, email, phone, nowIso());
   const userId = Number(result.lastInsertRowid);
 
-  // 注册必须验证邮箱后才能激活：先发验证邮件，未成功送达则回滚刚插入的账户，
-  // 避免产生"永远无法验证"的半完成账户（与 MFA 发码一致的容错：生产环境发不出即视为失败）。
-  const freshUser = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
-  try {
-    await mfa.issueCode('email', freshUser);
-  } catch (e) {
-    console.error('[loginapp] 注册验证邮件发送失败:', e);
-    db.prepare('DELETE FROM users WHERE id = ?').run(userId);
-    return fail('验证码邮件发送失败，请稍后重试或联系管理员。');
-  }
-
   recordRegister(ip);
-  // 进入"邮箱验证"步骤（尚未激活，不能登录 / 使用），验证通过后才进入 2FA 绑定。
+  // 注册不自动发码：进入"邮箱验证"步骤（尚未激活，不能登录/使用）。
+  // 验证邮件必须由用户在验证页先通过 reCAPTCHA（POST /register/resend-email）
+  // 主动点击「发送验证码」才会真正发出——先验证、后发码。
   req.session = rotateSession(req.session.id, {
     userId,
     state: 'verify_email',
@@ -587,14 +579,15 @@ app.post('/register/verify-email', express.urlencoded({ extended: false }), csrf
   res.redirect('/setup-2fa');
 });
 
-// 注册验证邮件重发（消耗邮件资源，受 Cloudflare Turnstile 把门，与 /2fa/send 一致）。
+// 注册验证邮件发送 / 重发（消耗邮件资源，必须先过 reCAPTCHA，与 /2fa/send 一致）。
+// 注册时不再自动发码，验证邮件只在这里、且仅在 reCAPTCHA 通过后发出。
 app.post('/register/resend-email', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
   const s = req.session;
   if (s.state !== 'verify_email' || !s.user) return res.redirect('/register');
   const ip = req.ip || '';
-  const rc = await verifyTurnstile(req.body['cf-turnstile-response'], ip, 'register-resend');
+  const rc = await verifyRecaptcha(req.body['g-recaptcha-response'], ip);
   if (!rc.ok) {
-    console.warn('[loginapp] /register/resend-email Turnstile 校验失败:', rc.reason, rc.codes || '');
+    console.warn('[loginapp] /register/resend-email reCAPTCHA 校验失败:', rc.reason, rc.codes || '');
     return res.redirect('/register/verify-email?e=robot');
   }
   try {
@@ -705,7 +698,7 @@ app.get('/setup-2fa/:method', async (req, res) => {
   if (userMfaMethod(s.user)) return res.redirect('/dashboard');
   if (!methodEnabled(method)) return res.redirect('/setup-2fa?e=1');
 
-  // 不再自动发码——必须先通过 Cloudflare Turnstile（POST /setup-2fa/:method/send）才会真正发送。
+  // 不再自动发码——必须先通过 Google reCAPTCHA（POST /setup-2fa/:method/send）才会真正发送。
   const hasCode = mfa.hasValidCode(method, s.user.id);
   res.send(
     pages.setupCodePage({
@@ -728,11 +721,12 @@ app.post('/setup-2fa/:method/send', express.urlencoded({ extended: false }), csr
   if (userMfaMethod(s.user)) return res.redirect('/dashboard');
   if (!methodEnabled(method)) return res.redirect('/setup-2fa?e=1');
 
-  // 重发验证码会真实消耗邮件 / 短信资源，必须先过 Cloudflare Turnstile
+  // 发码会真实消耗邮件 / 短信资源，必须先过 Google reCAPTCHA v2（recaptcha.net），
+  // 验证通过之后才真正发送——绝不在验证前发码。
   const ip = req.ip || '';
-  const cap = await verifyTurnstile(req.body['cf-turnstile-response'], ip, 'setup-resend');
+  const cap = await verifyRecaptcha(req.body['g-recaptcha-response'], ip);
   if (!cap.ok) {
-    console.warn('[loginapp] /setup-2fa send Turnstile 校验失败:', cap.reason, cap.codes || '');
+    console.warn('[loginapp] /setup-2fa send reCAPTCHA 校验失败:', cap.reason, cap.codes || '');
     return res.redirect(`/setup-2fa/${method}?e=robot`);
   }
 
