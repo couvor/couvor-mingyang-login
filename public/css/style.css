@@ -261,6 +261,19 @@ html.dark .theme-btn .icon-moon { display: none; }
 .form-foot { margin-top: 24px; font-size: 13px; color: var(--mute); }
 .form-foot a { color: var(--fg); }
 
+/* 登录页底部：注册入口与忘记密码两端对齐、拉开间距；窄屏自动换行 */
+.form-foot-split {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  margin-top: 24px;
+}
+.form-foot-split .form-foot { margin-top: 0; }
+@media (max-width: 420px) {
+  .form-foot-split { flex-direction: column; align-items: flex-start; gap: 10px; }
+}
+
 /* ---------- 按钮（规范 §5：2px 方角、mono、hover 上浮） ---------- */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
