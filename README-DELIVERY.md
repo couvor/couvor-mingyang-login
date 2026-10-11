@@ -189,6 +189,23 @@ read -r -s -p 'SMTP 密码: ' P \
 - **对象键**：`avatars/<userId>/<24 位随机 hex>.webp`，随机后缀天然规避缓存旧图，
   故可长缓存（COS 侧 `max-age=31536000`）；换头像时先写新后删旧，清理失败只记日志。
 
+**当前线上配置（2026-10-11 生效）**
+
+| 项 | 值 |
+| --- | --- |
+| 桶 | `xueqiao-1314767018`（学桥在用，地域 `ap-shanghai`） |
+| 密钥 | `/etc/loginapp.env` 的 `COS_SECRET_ID` / `COS_SECRET_KEY`，**来自另一账号**的 CAM 子账号密钥（与 SES 用的 `TENCENT_SECRET_*` 不是同一对） |
+| 桶 ACL | `public-read`（公有读私有写） |
+| 访问域名 | `https://xueqiao-1314767018.cos.ap-shanghai.myqcloud.com`（已自动加入 CSP `img-src`） |
+| 对象前缀 | `avatars/<userId>/<hex>.webp`（与 `tutor-materials/` 并存，互不干扰） |
+
+服务器上 `/etc/passwd-cosfs` 是本机的 COS 凭据文件（宝塔 cosfs 挂载 `/www/cosfs/xueqiao` 用），
+即上面那对密钥的来源；它权限 `640 root:root`，切勿扩散。
+
+> ⚠️ 桶为公有读 ⇒ `tutor-materials/` 下的对象（目前 1 个）同样可被匿名访问。
+> 如需收紧：把桶改回 `private`，并改为上传时对 `avatars/` 对象设 `public-read`（对象级 ACL），
+> 这样资料目录不受影响；改动前请先确认。
+
 **控制台准备（一次性，全部由你在腾讯云控制台完成，代码不会自动创建任何云资源）**
 
 1. 开通「对象存储 COS」→ 创建桶：**公有读私有写**、地域自选（建议 `ap-guangzhou`）。
