@@ -85,6 +85,16 @@ app.use(
   })
 );
 
+// ---------- 动态响应禁缓存 ----------
+// 位于 express.static 之后：静态文件由上面按 maxAge 自带缓存策略（命中即返回、不会走到这里），
+// 此中间件只对动态路由（HTML 页面、接口）生效。页面引用的第三方脚本地址/CSP/守卫逻辑
+// 随部署演进，HTML 被浏览器缓存会让用户停留在旧版页面（如仍引用被墙的 google.com 版
+// api.js、无挂件加载守卫），表现为「复选框不出现、发送必失败」。
+app.use((req, res, next) => {
+  if (!res.getHeader('Cache-Control')) res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+
 // ---------- SSO 辅助（本服务作为 IdP） ----------
 const SSO_PENDING_COOKIE = 'sso_pending';
 
