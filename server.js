@@ -48,9 +48,9 @@ app.use((req, res, next) => {
       "frame-ancestors 'none'",
       `img-src 'self' data:${AVATAR_IMG_ORIGIN ? ' ' + AVATAR_IMG_ORIGIN : ''}`,
       "style-src 'self' 'unsafe-inline'",
-      "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com https://www.google.com https://www.gstatic.com",
-      "frame-src https://challenges.cloudflare.com https://www.google.com https://www.gstatic.com",
-      "connect-src https://challenges.cloudflare.com https://www.google.com https://www.gstatic.com",
+      "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com https://www.google.com https://www.recaptcha.net https://www.gstatic.com",
+      "frame-src https://challenges.cloudflare.com https://www.google.com https://www.recaptcha.net https://www.gstatic.com",
+      "connect-src https://challenges.cloudflare.com https://www.google.com https://www.recaptcha.net https://www.gstatic.com",
       "object-src 'none'",
     ].join('; ')
   );

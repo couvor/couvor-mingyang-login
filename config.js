@@ -132,6 +132,11 @@ module.exports = {
   // secret 未填（占位符/为空）时回退到 Google 官方测试密钥对，验证恒通过，保证本地联调；
   // 填入真实 secret 后正式密钥原子生效。secret 属于机密，不得写入代码或日志。
   // 设为 RECAPTCHA_DISABLED=1 可完全关闭（与 turnstile 一致）。
+  //
+  // 国内访问：google.com 被墙，前端脚本与本站（腾讯云轻量，位于大陆）的服务端校验都会超时/失败。
+  // 故默认使用 Google 官方备用域名 RECAPTCHA_API_HOST=www.recaptcha.net（同一套密钥，
+  // 仅换主机名），脚本加载与服务端 siteverify 在国内均可达。需要切回 google 时
+  // 在 /etc/loginapp.env 设 RECAPTCHA_API_HOST=www.google.com 即可。
   recaptcha: (() => {
     const TEST = {
       siteKey: '6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI',
@@ -141,11 +146,14 @@ module.exports = {
     const envSecret = (process.env.RECAPTCHA_SECRET_KEY || '').trim();
     const secretIsPlaceholder = !envSecret || envSecret.includes('__REPLACE_ME__');
     const live = !!envSite && !secretIsPlaceholder;
+    const apiHost = (process.env.RECAPTCHA_API_HOST || 'www.recaptcha.net').trim();
     return {
       siteKey: live ? envSite : TEST.siteKey,
       secretKey: live ? envSecret : TEST.secretKey,
       live,
-      verifyUrl: 'https://www.google.com/recaptcha/api/siteverify',
+      apiHost,
+      // 校验接口与脚本同域，确保服务端（大陆）出网也走可达的 recaptcha.net
+      verifyUrl: `https://${apiHost}/recaptcha/api/siteverify`,
       enabled: process.env.RECAPTCHA_DISABLED !== '1',
     };
   })(),
