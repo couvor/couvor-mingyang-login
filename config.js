@@ -196,7 +196,13 @@ module.exports = {
       secretKey, // 机密：仅内部使用，禁止写入日志
       publicBase,
       configured,
-      // 输出规格：统一裁剪为正方形并转 WebP，控制体积与加载速度
+      // 输出规    configured,
+    // 对象级 ACL：桶整体保持私有（最小权限），仅对头像对象单独开公有读，
+    // 这样桶内其它前缀（如 tutor-materials/）不会被公开。
+    // 可用 COS_OBJECT_ACL 覆盖：设为 inherit 则跟随桶 ACL（适合桶整体公有读的旧方案）。
+    // 注意：若桶在控制台开启了「阻止公有访问」，对象级 public-read 不生效，匿名读取会 403。
+    objectAcl: envVal('COS_OBJECT_ACL') || 'public-read',
+    // 输出规格：统一裁剪为正方形并转 WebP，控制体积与加载速度
       size: 256,
       maxBytes: 5 * 1024 * 1024, // 上传上限 5MB
       allowedFormats: ['jpeg', 'png', 'webp', 'gif', 'avif'],
