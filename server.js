@@ -17,6 +17,7 @@ const {
   loginLocked, recordLoginFail, clearLoginFails, registerAllowed, recordRegister,
 } = require('./lib/ratelimit');
 const { verifyTurnstile } = require('./lib/turnstile');
+const { verifyRecaptcha } = require('./lib/recaptcha');
 const pages = require('./lib/pages');
 const multer = require('multer');
 const avatar = require('./lib/avatar');
@@ -47,9 +48,9 @@ app.use((req, res, next) => {
       "frame-ancestors 'none'",
       `img-src 'self' data:${AVATAR_IMG_ORIGIN ? ' ' + AVATAR_IMG_ORIGIN : ''}`,
       "style-src 'self' 'unsafe-inline'",
-      "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com",
-      "frame-src https://challenges.cloudflare.com",
-      "connect-src https://challenges.cloudflare.com",
+      "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com https://www.google.com https://www.gstatic.com",
+      "frame-src https://challenges.cloudflare.com https://www.google.com https://www.gstatic.com",
+      "connect-src https://challenges.cloudflare.com https://www.google.com https://www.gstatic.com",
       "object-src 'none'",
     ].join('; ')
   );
@@ -316,10 +317,12 @@ app.get('/2fa', async (req, res) => {
   const s = req.session;
   if (s.state !== 'pending_2fa' || !s.user) return res.redirect('/');
   const method = s.mfa_method || userMfaMethod(s.user) || 'totp';
+  const qErr = req.query.e;
+  const pageError = qErr === 'robot' ? '人机验证未通过，请重试。' : '';
 
   if (method === 'totp') {
     return res.send(
-      pages.twofaPage({ csrf: s.csrf_token, username: s.user.username, method: 'totp' })
+      pages.twofaPage({ csrf: s.csrf_token, username: s.user.username, method: 'totp', error: pageError })
     );
   }
 
@@ -342,6 +345,7 @@ app.get('/2fa', async (req, res) => {
       target: mfaTarget(s.user, method),
       notice,
       devCode,
+      error: pageError,
     })
   );
 });
@@ -352,6 +356,13 @@ app.post('/2fa/send', express.urlencoded({ extended: false }), csrfGuard, async 
   if (s.state !== 'pending_2fa' || !s.user) return res.redirect('/');
   const method = s.mfa_method || userMfaMethod(s.user);
   if (method !== 'email' && method !== 'phone') return res.redirect('/2fa');
+
+  // 重发验证码会真实消耗邮件 / 短信资源，必须先过 Google reCAPTCHA v2
+  const ip = req.ip || '';
+  const cap = await verifyRecaptcha(req.body['g-recaptcha-response'], ip);
+  if (!cap.ok) {
+    return res.redirect('/2fa?e=robot');
+  }
 
   let notice = '';
   let devCode = null;
@@ -638,7 +649,7 @@ app.get('/setup-2fa/:method', async (req, res) => {
       username: s.user.username,
       notice,
       devCode,
-      error: req.query.e === '1' ? '验证码不正确，请重试。' : '',
+      error: req.query.e === '1' ? '验证码不正确，请重试。' : req.query.e === 'robot' ? '人机验证未通过，请重试。' : '',
     })
   );
 });
@@ -650,6 +661,13 @@ app.post('/setup-2fa/:method/send', express.urlencoded({ extended: false }), csr
   if (!s.user || !['setup_2fa', 'authed'].includes(s.state)) return res.redirect('/');
   if (userMfaMethod(s.user)) return res.redirect('/dashboard');
   if (!methodEnabled(method)) return res.redirect('/setup-2fa?e=1');
+
+  // 重发验证码会真实消耗邮件 / 短信资源，必须先过 Google reCAPTCHA v2
+  const ip = req.ip || '';
+  const cap = await verifyRecaptcha(req.body['g-recaptcha-response'], ip);
+  if (!cap.ok) {
+    return res.redirect(`/setup-2fa/${method}?e=robot`);
+  }
 
   let notice = '';
   let devCode = null;

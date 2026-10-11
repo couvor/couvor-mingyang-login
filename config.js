@@ -126,6 +126,30 @@ module.exports = {
     };
   })(),
 
+  // Google reCAPTCHA v2（仅用于邮箱 / 手机验证码重发等会消耗外部资源的人机校验）。
+  // 密钥从 /etc/loginapp.env（systemd EnvironmentFile）读取：
+  //   RECAPTCHA_SITE_KEY / RECAPTCHA_SECRET_KEY
+  // secret 未填（占位符/为空）时回退到 Google 官方测试密钥对，验证恒通过，保证本地联调；
+  // 填入真实 secret 后正式密钥原子生效。secret 属于机密，不得写入代码或日志。
+  // 设为 RECAPTCHA_DISABLED=1 可完全关闭（与 turnstile 一致）。
+  recaptcha: (() => {
+    const TEST = {
+      siteKey: '6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI',
+      secretKey: '6LeIxAcTAAAAAGG-vFI1TnRWxMZNFuojJ4WifJWe',
+    };
+    const envSite = (process.env.RECAPTCHA_SITE_KEY || '').trim();
+    const envSecret = (process.env.RECAPTCHA_SECRET_KEY || '').trim();
+    const secretIsPlaceholder = !envSecret || envSecret.includes('__REPLACE_ME__');
+    const live = !!envSite && !secretIsPlaceholder;
+    return {
+      siteKey: live ? envSite : TEST.siteKey,
+      secretKey: live ? envSecret : TEST.secretKey,
+      live,
+      verifyUrl: 'https://www.google.com/recaptcha/api/siteverify',
+      enabled: process.env.RECAPTCHA_DISABLED !== '1',
+    };
+  })(),
+
   session: {
     cookieName: 'mysid',
     ttlMs: 7 * 24 * 3600 * 1000, // 7 天滑动过期
