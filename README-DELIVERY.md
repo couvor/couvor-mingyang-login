@@ -195,16 +195,21 @@ read -r -s -p 'SMTP 密码: ' P \
 | --- | --- |
 | 桶 | `xueqiao-1314767018`（学桥在用，地域 `ap-shanghai`） |
 | 密钥 | `/etc/loginapp.env` 的 `COS_SECRET_ID` / `COS_SECRET_KEY`，**来自另一账号**的 CAM 子账号密钥（与 SES 用的 `TENCENT_SECRET_*` 不是同一对） |
-| 桶 ACL | `public-read`（公有读私有写） |
+| 桶 ACL | `private`（**最小权限方案，2026-10-11 起生效**）：桶整体私有，仅上传时对 `avatars/` 下的**单个对象**带 `public-read` ACL（`COS_OBJECT_ACL` 可覆盖，`inherit` 则跟随桶） |
 | 访问域名 | `https://xueqiao-1314767018.cos.ap-shanghai.myqcloud.com`（已自动加入 CSP `img-src`） |
-| 对象前缀 | `avatars/<userId>/<hex>.webp`（与 `tutor-materials/` 并存，互不干扰） |
+| 对象前缀 | `avatars/<userId>/<hex>.webp`（与 `tutor-materials/` 并存；后者保持私有，匿名读取 403，实测验过） |
 
 服务器上 `/etc/passwd-cosfs` 是本机的 COS 凭据文件（宝塔 cosfs 挂载 `/www/cosfs/xueqiao` 用），
 即上面那对密钥的来源；它权限 `640 root:root`，切勿扩散。
 
-> ⚠️ 桶为公有读 ⇒ `tutor-materials/` 下的对象（目前 1 个）同样可被匿名访问。
-> 如需收紧：把桶改回 `private`，并改为上传时对 `avatars/` 对象设 `public-read`（对象级 ACL），
-> 这样资料目录不受影响；改动前请先确认。
+> **滥用面评估（最小权限原则下的现状）**：
+> - 桶级：私有，匿名只能读**已上传头像的单个对象**（URL 含 24 位随机后缀，不可枚举），
+>   匿名列桶 / 读其它前缀均 403（实测）；
+> - 写入面：只有本服务进程能写（密钥在服务器本地），上传入口有 Turnstile 会话 +
+>   5MB 上限 + 每用户每小时 20 次 + 输出恒为 ≤ 数 KB 的 256×256 WebP，刷流量空间很小；
+> - **CAM 层面待收紧（需你在控制台操作，代码侧不动）**：这对子账号密钥目前能改桶 ACL
+>   （`putBucketAcl` 成功过），建议到 CAM 把该子账号策略收紧为**仅该桶**的
+>   `cos:PutObject` / `cos:DeleteObject`（再加 `cos:GetObject` 供读回），去掉桶级管理权限。
 
 **控制台准备（一次性，全部由你在腾讯云控制台完成，代码不会自动创建任何云资源）**
 
