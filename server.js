@@ -221,14 +221,7 @@ function mfaTarget(user, method) {
   return '';
 }
 
-// 邮箱/手机方式：确保存在一条未过期的验证码；不存在才发新的，刷新页面不会重复发送。
-async function ensureCode(method, user) {
-  const fresh = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
-  const expCol = method === 'email' ? 'email_code_expires' : 'phone_code_expires';
-  if (fresh && fresh[expCol] && fresh[expCol] > nowIso()) return { devCode: null, sent: false };
-  const r = await mfa.issueCode(method, user);
-  return { devCode: r.devCode, sent: true };
-}
+// （原 ensureCode「进页面自动发码」已移除：发码必须先过 reCAPTCHA，见 POST /2fa/send。）
 
 // 绑定成功：写入启用的方式 → 置为已认证 → 续接 SSO 或回默认落地页。
 function completeMfaSetup(req, res, user, method) {
@@ -326,26 +319,18 @@ app.get('/2fa', async (req, res) => {
     );
   }
 
-  // 邮箱/手机：进入本页时若还没有有效验证码则自动发送一次（刷新不会重复发）
-  let notice = '';
-  let devCode = null;
-  try {
-    const r = await ensureCode(method, s.user);
-    if (r.sent) notice = `验证码已发送至 ${mfaTarget(s.user, method)}。`;
-    devCode = r.devCode;
-  } catch (e) {
-    console.error('[loginapp] 发送验证码失败:', e);
-    notice = '验证码发送失败，请稍后重试。';
-  }
+  // 邮箱/手机：不再自动发码——必须先通过 reCAPTCHA（POST /2fa/send）才会真正发送。
+  // 已有未过期验证码（刚发过或刷新页面）时直接显示输入框。
+  const hasCode = mfa.hasValidCode(method, s.user.id);
   res.send(
     pages.twofaPage({
       csrf: s.csrf_token,
       username: s.user.username,
       method,
       target: mfaTarget(s.user, method),
-      notice,
-      devCode,
+      notice: hasCode ? `验证码已发送至 ${mfaTarget(s.user, method)}，10 分钟内有效。` : '',
       error: pageError,
+      needSend: !hasCode,
     })
   );
 });
@@ -631,25 +616,17 @@ app.get('/setup-2fa/:method', async (req, res) => {
   if (userMfaMethod(s.user)) return res.redirect('/dashboard');
   if (!methodEnabled(method)) return res.redirect('/setup-2fa?e=1');
 
-  let notice = '';
-  let devCode = null;
-  try {
-    const r = await ensureCode(method, s.user);
-    if (r.sent) notice = `验证码已发送至 ${mfaTarget(s.user, method)}。`;
-    devCode = r.devCode;
-  } catch (e) {
-    console.error('[loginapp] 发送验证码失败:', e);
-    notice = '验证码发送失败，请稍后重试。';
-  }
+  // 不再自动发码——必须先通过 reCAPTCHA（POST /setup-2fa/:method/send）才会真正发送。
+  const hasCode = mfa.hasValidCode(method, s.user.id);
   res.send(
     pages.setupCodePage({
       csrf: s.csrf_token,
       method,
       target: mfaTarget(s.user, method),
       username: s.user.username,
-      notice,
-      devCode,
+      notice: hasCode ? `验证码已发送至 ${mfaTarget(s.user, method)}，10 分钟内有效。` : '',
       error: req.query.e === '1' ? '验证码不正确，请重试。' : req.query.e === 'robot' ? '人机验证未通过，请重试。' : '',
+      needSend: !hasCode,
     })
   );
 });
