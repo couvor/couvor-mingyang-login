@@ -257,11 +257,14 @@ app.get('/', (req, res) => {
   if (s.state === 'authed') return res.redirect('/dashboard');
   if (s.state === 'pending_2fa') return res.redirect('/2fa');
   if (s.state === 'setup_2fa') return res.redirect('/setup-2fa');
+  if (s.state === 'reset_code') return res.redirect('/forgot-password/code');
+  if (s.state === 'reset_set') return res.redirect('/forgot-password/reset');
   const loggedOut = req.query.bye === '1';
+  const reset = req.query.reset === '1';
   res.send(
     pages.loginPage({
       csrf: s.csrf_token,
-      notice: loggedOut ? '已安全退出。' : '',
+      notice: reset ? '密码已重置成功，请使用新密码登录。' : loggedOut ? '已安全退出。' : '',
       error: req.query.locked === '1' ? '尝试过于频繁，账号已临时锁定，请稍后再试。' : '',
     })
   );
@@ -917,6 +920,188 @@ app.get('/logout', (req, res) => {
   // SSO 客户端退出联动：清掉本站会话后回跳客户端（白名单校验）
   const next = safeLogoutNext(String(req.query.next || ''));
   res.redirect(next || '/?bye=1');
+});
+
+// ---------- 忘记密码：站内三步流程（账号标识 → 邮箱验证码 → 设新密码） ----------
+// 全程复用既有安全机制：第一步 Turnstile 防滥用；发码前 Google reCAPTCHA（消耗邮件资源）；
+// 重置验证码独立存列，不与登录/绑定的 email_code_* 混淆；通过后踢掉该用户所有已登录会话。
+
+function resetUserId(req) {
+  const v = req.session && req.session.reset_user_id;
+  return typeof v === 'number' ? v : null;
+}
+
+// 第一步：输入账号标识（用户名或邮箱）
+app.get('/forgot-password', (req, res) => {
+  const s = req.session;
+  if (s.state === 'authed') return res.redirect('/dashboard');
+  if (s.state === 'reset_code') return res.redirect('/forgot-password/code');
+  if (s.state === 'reset_set') return res.redirect('/forgot-password/reset');
+  res.send(pages.forgotPasswordPage({ csrf: s.csrf_token }));
+});
+
+app.post('/forgot-password', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
+  const s = req.session;
+  if (s.state === 'authed') return res.redirect('/dashboard');
+  const ip = req.ip || '';
+  const ident = String(req.body.account || '').trim().toLowerCase();
+
+  const ts = await verifyTurnstile(req.body['cf-turnstile-response'], ip, 'forgot');
+  if (!ts.ok) {
+    return res.status(400).send(
+      pages.forgotPasswordPage({
+        csrf: s.csrf_token,
+        account: ident,
+        error: '人机验证未通过，请重试。' + (config.env === 'development' ? ` (${ts.reason})` : ''),
+      })
+    );
+  }
+
+  // 防账号枚举：无论账号是否存在，统一提示「已发送（若存在）」。
+  const user = db.prepare('SELECT * FROM users WHERE username = ? OR email = ?').get(ident, ident);
+  if (!user || !user.email) {
+    return res.send(
+      pages.messagePage({
+        title: '请查收邮件',
+        kicker: 'RESET PASSWORD',
+        message: '如果该账号（用户名或邮箱）存在于我们的系统，我们已向其关联的邮箱发送了一封重置密码邮件。邮件有效期 10 分钟。如未收到，请确认填写的账号无误或稍后重试。',
+        backHref: '/forgot-password',
+        backText: '重新填写',
+      })
+    );
+  }
+
+  // 进入待校验态，记录归属用户；发码延迟到用户点「发送验证码」（先过 reCAPTCHA，
+  // 避免无谓消耗邮件资源，与注册验证邮件「先验证、后发码」的范式一致）。
+  req.session = rotateSession(s.id, { state: 'reset_code' });
+  db.prepare('UPDATE sessions SET reset_user_id = ? WHERE id = ?').run(user.id, req.session.id);
+  setSessionCookie(res, req.session.id);
+  res.redirect('/forgot-password/code');
+});
+
+// 第二步：输入验证码
+app.get('/forgot-password/code', (req, res) => {
+  const s = req.session;
+  if (s.state === 'authed') return res.redirect('/dashboard');
+  const uid = resetUserId(req);
+  if (s.state !== 'reset_code' || !uid) return res.redirect('/forgot-password');
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  if (!user) return res.redirect('/forgot-password');
+  const needSend = !mfa.hasValidResetCode(user.id);
+  const pageError = req.query.e === 'robot' ? '人机验证未通过，请重试。' : '';
+  res.send(
+    pages.forgotCodePage({
+      csrf: s.csrf_token,
+      username: user.username,
+      target: mfaTarget(user, 'email'),
+      needSend,
+      error: pageError,
+    })
+  );
+});
+
+// 重发重置验证码（消耗邮件资源，必须先过 reCAPTCHA）
+app.post('/forgot-password/send', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
+  const s = req.session;
+  const uid = resetUserId(req);
+  if (s.state !== 'reset_code' || !uid) return res.redirect('/forgot-password');
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  if (!user) return res.redirect('/forgot-password');
+
+  const ip = req.ip || '';
+  const cap = await verifyRecaptcha(req.body['g-recaptcha-response'], ip);
+  if (!cap.ok) {
+    console.warn('[loginapp] /forgot-password/send reCAPTCHA 校验失败:', cap.reason, cap.codes || '');
+    return res.redirect('/forgot-password/code?e=robot');
+  }
+
+  let notice = '';
+  let devCode = null;
+  try {
+    const r = await mfa.issueResetCode(user);
+    notice = `验证码已重新发送至 ${mfaTarget(user, 'email')}。`;
+    devCode = r.devCode;
+  } catch (e) {
+    console.error('[loginapp] 重置密码重发验证码失败:', e);
+    notice = '验证码发送失败，请稍后重试。';
+  }
+  res.send(
+    pages.forgotCodePage({
+      csrf: s.csrf_token,
+      username: user.username,
+      target: mfaTarget(user, 'email'),
+      notice,
+      devCode,
+    })
+  );
+});
+
+app.post('/forgot-password/code', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
+  const s = req.session;
+  const uid = resetUserId(req);
+  if (s.state !== 'reset_code' || !uid) return res.redirect('/forgot-password');
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  if (!user) return res.redirect('/forgot-password');
+
+  const input = String(req.body.code || '').trim();
+  if (!mfa.verifyResetCode(user.id, input)) {
+    return res.status(400).send(
+      pages.forgotCodePage({
+        csrf: s.csrf_token,
+        username: user.username,
+        target: mfaTarget(user, 'email'),
+        error: '验证码不正确或已过期，请重试。',
+      })
+    );
+  }
+
+  mfa.consumeResetCode(user.id);
+  // 通过校验：进入「待设新密码」态，并记录归属用户。
+  req.session = rotateSession(s.id, { state: 'reset_set' });
+  db.prepare('UPDATE sessions SET reset_user_id = ? WHERE id = ?').run(uid, req.session.id);
+  setSessionCookie(res, req.session.id);
+  res.redirect('/forgot-password/reset');
+});
+
+// 第三步：设置新密码
+app.get('/forgot-password/reset', (req, res) => {
+  const s = req.session;
+  if (s.state === 'authed') return res.redirect('/dashboard');
+  const uid = resetUserId(req);
+  if (s.state !== 'reset_set' || !uid) return res.redirect('/forgot-password');
+  res.send(pages.resetPasswordPage({ csrf: s.csrf_token }));
+});
+
+app.post('/forgot-password/reset', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
+  const s = req.session;
+  const uid = resetUserId(req);
+  if (s.state !== 'reset_set' || !uid) return res.redirect('/forgot-password');
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  if (!user) return res.redirect('/forgot-password');
+
+  const password = String(req.body.password || '');
+  const password2 = String(req.body.password2 || '');
+
+  const fail = (msg) =>
+    res.status(400).send(pages.resetPasswordPage({ csrf: s.csrf_token, error: msg }));
+
+  if (password.length < 8 || password.length > 72) {
+    return fail('密码长度需在 8–72 位之间。');
+  }
+  if (password !== password2) {
+    return fail('两次输入的密码不一致。');
+  }
+
+  const hash = await bcrypt.hash(password, config.bcryptRounds);
+  db.prepare('UPDATE users SET password_hash = ?, reset_code_hash = NULL, reset_code_expires = NULL WHERE id = ?').run(
+    hash,
+    uid
+  );
+  // 安全：重置成功后使该用户所有已登录会话失效，强制重新登录。
+  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(uid);
+  destroySession(s.id);
+  clearSessionCookie(res);
+  res.redirect('/?reset=1');
 });
 
 // ---------- SSO：作为 IdP 为学桥等客户端提供登录 ----------
