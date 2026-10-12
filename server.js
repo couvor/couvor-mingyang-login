@@ -46,11 +46,15 @@ app.use((req, res, next) => {
       "base-uri 'self'",
       "form-action 'self'",
       "frame-ancestors 'none'",
-      `img-src 'self' data:${AVATAR_IMG_ORIGIN ? ' ' + AVATAR_IMG_ORIGIN : ''}`,
+      `img-src 'self' data: https://www.gstatic.cn https://www.gstatic.com${AVATAR_IMG_ORIGIN ? ' ' + AVATAR_IMG_ORIGIN : ''}`,
       "style-src 'self' 'unsafe-inline'",
-      "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com https://www.recaptcha.net https://www.google.com https://www.gstatic.com",
-      "frame-src https://challenges.cloudflare.com https://www.recaptcha.net https://www.google.com https://www.gstatic.com",
-      "connect-src https://challenges.cloudflare.com https://www.recaptcha.net https://www.google.com https://www.gstatic.com",
+      // 注意：reCAPTCHA 的 api.js 只是一个加载器，真正的渲染引擎 recaptcha__*.js
+      // 由它动态注入。走 www.recaptcha.net 时该脚本来自 www.gstatic.cn（国内镜像），
+      // 走 www.google.com 时来自 www.gstatic.com —— 两个域名必须同时放行，
+      // 否则引擎被 CSP 拦截，grecaptcha.render 不存在，.g-recaptcha 挂件永远空白。
+      "script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com https://www.recaptcha.net https://www.google.com https://www.gstatic.com https://www.gstatic.cn",
+      "frame-src https://challenges.cloudflare.com https://www.recaptcha.net https://www.google.com https://www.gstatic.com https://www.gstatic.cn",
+      "connect-src https://challenges.cloudflare.com https://www.recaptcha.net https://www.google.com https://www.gstatic.com https://www.gstatic.cn",
       "object-src 'none'",
     ].join('; ')
   );
