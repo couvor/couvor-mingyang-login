@@ -537,7 +537,6 @@ app.post('/2fa', express.urlencoded({ extended: false }), csrfGuard, (req, res) 
 // 注册
 app.get('/register', (req, res) => {
   if (req.session.state === 'authed') return res.redirect('/dashboard');
-  if (req.session.state === 'verify_email') return res.redirect('/register/verify-email');
   res.send(pages.registerPage({ csrf: req.session.csrf_token }));
 });
 
@@ -598,86 +597,19 @@ app.post('/register', express.urlencoded({ extended: false }), csrfGuard, async 
   const userId = Number(result.lastInsertRowid);
 
   recordRegister(ip);
-  // 注册不自动发码：进入"邮箱验证"步骤（尚未激活，不能登录/使用）。
-  // 验证邮件必须由用户在验证页先通过 reCAPTCHA（POST /register/resend-email）
-  // 主动点击「发送验证码」才会真正发出——先验证、后发码。
+  // 注册即激活：不再强制邮箱验证，直接进入二次验证绑定（TOTP / 邮箱 / 手机 三选一）。
+  // 邮箱归属只在用户主动选择「邮箱验证」作为二次验证方式时才被证实（绑定成功置 email_verified=1）。
   req.session = rotateSession(req.session.id, {
     userId,
-    state: 'verify_email',
+    state: 'setup_2fa',
   });
   setSessionCookie(res, req.session.id);
-  res.redirect('/register/verify-email');
-});
-
-// 注册后的邮箱验证（必须在验证通过后才能激活账户 / 进入 2FA 绑定）。
-app.get('/register/verify-email', (req, res) => {
-  const s = req.session;
-  if (s.state === 'authed') return res.redirect('/dashboard');
-  if (s.state === 'setup_2fa') {
-    return s.user && s.user.email_verified ? res.redirect('/setup-2fa') : res.redirect('/register');
-  }
-  if (s.state !== 'verify_email' || !s.user) return res.redirect('/register');
-  const needSend = !mfa.hasValidCode('email', s.user.id);
-  let error = '';
-  if (req.query.e === 'robot') error = '人机验证未通过，请重试。';
-  else if (req.query.e === 'fail') error = '验证码邮件发送失败，请稍后重试。';
-  res.send(
-    pages.registerVerifyEmailPage({
-      csrf: s.csrf_token,
-      username: s.user.username,
-      target: s.user.email,
-      needSend,
-      error,
-    })
-  );
-});
-
-app.post('/register/verify-email', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
-  const s = req.session;
-  if (s.state !== 'verify_email' || !s.user) return res.redirect('/register');
-  const input = String(req.body.code || '').trim();
-  if (!mfa.verifyCode('email', s.user.id, input)) {
-    return res.status(400).send(
-      pages.registerVerifyEmailPage({
-        csrf: s.csrf_token,
-        username: s.user.username,
-        target: s.user.email,
-        error: '验证码不正确或已过期，请重试。',
-      })
-    );
-  }
-  db.prepare('UPDATE users SET email_verified = 1 WHERE id = ?').run(s.user.id);
-  mfa.consumeCode('email', s.user.id);
-  // 邮箱已验证 → 正式激活账户，进入强制 2FA 绑定
-  req.session = rotateSession(s.id, { userId: s.user.id, state: 'setup_2fa' });
-  setSessionCookie(res, req.session.id);
   res.redirect('/setup-2fa');
-});
-
-// 注册验证邮件发送 / 重发（消耗邮件资源，必须先过 reCAPTCHA，与 /2fa/send 一致）。
-// 注册时不再自动发码，验证邮件只在这里、且仅在 reCAPTCHA 通过后发出。
-app.post('/register/resend-email', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
-  const s = req.session;
-  if (s.state !== 'verify_email' || !s.user) return res.redirect('/register');
-  const ip = req.ip || '';
-  const rc = await verifyRecaptcha(req.body['g-recaptcha-response'], ip);
-  if (!rc.ok) {
-    console.warn('[loginapp] /register/resend-email reCAPTCHA 校验失败:', rc.reason, rc.codes || '');
-    return res.redirect('/register/verify-email?e=robot');
-  }
-  try {
-    await mfa.issueCode('email', s.user);
-  } catch (e) {
-    console.error('[loginapp] 注册验证邮件重发失败:', e);
-    return res.redirect('/register/verify-email?e=fail');
-  }
-  res.redirect('/register/verify-email');
 });
 
 // 二次验证绑定 · 方式选择（TOTP / 邮箱 / 手机）
 app.get('/setup-2fa', (req, res) => {
   const s = req.session;
-  if (s.state === 'verify_email') return res.redirect('/register/verify-email');
   if (!s.user || !['setup_2fa', 'authed'].includes(s.state)) return res.redirect('/');
   if (userMfaMethod(s.user)) return res.redirect('/dashboard');
   res.send(
