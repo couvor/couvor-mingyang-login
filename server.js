@@ -237,6 +237,16 @@ function mfaTarget(user, method) {
 function completeMfaSetup(req, res, user, method) {
   db.prepare('UPDATE users SET mfa_method = ? WHERE id = ?').run(method, user.id);
   db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso(), user.id);
+  // 管理员刚重置过密码 → 强制先改密再放行（force_password_change 由重置端点置位）。
+  if (user.force_password_change) {
+    req.session = rotateSession(req.session.id, {
+      userId: user.id,
+      state: 'change_password',
+      mfaMethod: method,
+    });
+    setSessionCookie(res, req.session.id);
+    return res.redirect('/change-password');
+  }
   req.session = rotateSession(req.session.id, {
     userId: user.id,
     state: 'authed',
@@ -251,6 +261,37 @@ function completeMfaSetup(req, res, user, method) {
 
 app.get('/healthz', (req, res) => res.type('text').send('ok'));
 
+// 管理员重置密码（仅本地 + Bearer 令牌，不经 nginx 对外暴露）。
+// 由学桥运营后台经 127.0.0.1 直连调用：重置密码 + 清掉 2FA + 强制改密 + 踢掉在线会话。
+app.post('/admin/api/reset-password', express.json(), async (req, res) => {
+  const token = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+  if (!config.adminApiToken || token !== config.adminApiToken) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  const remote = req.socket.remoteAddress || '';
+  const isLocal = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+  if (!isLocal) return res.status(403).json({ ok: false, error: 'forbidden' });
+
+  const body = req.body || {};
+  const uid = parseInt(String(body.ssoSub), 10);
+  const newPassword = String(body.newPassword || '');
+  if (!Number.isInteger(uid) || newPassword.length < 10) {
+    return res.status(400).json({ ok: false, error: 'bad request' });
+  }
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  if (!user) return res.status(404).json({ ok: false, error: 'user not found' });
+
+  const hash = await bcrypt.hash(newPassword, config.bcryptRounds);
+  db.prepare(
+    `UPDATE users SET password_hash = ?, totp_enabled = 0, mfa_method = NULL,
+       totp_secret = NULL, recovery_codes = NULL, force_password_change = 1 WHERE id = ?`
+  ).run(hash, uid);
+  // 踢掉该用户所有在线会话，强制用新密码重新登录并完成 2FA 重设。
+  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(uid);
+  console.log(`[loginapp] admin reset password for user ${uid} (forced 2FA re-setup + password change)`);
+  return res.json({ ok: true });
+});
+
 // 登录页
 app.get('/', (req, res) => {
   const s = req.session;
@@ -259,6 +300,7 @@ app.get('/', (req, res) => {
   if (s.state === 'setup_2fa') return res.redirect('/setup-2fa');
   if (s.state === 'reset_code') return res.redirect('/forgot-password/code');
   if (s.state === 'reset_set') return res.redirect('/forgot-password/reset');
+  if (s.state === 'change_password') return res.redirect('/change-password');
   const loggedOut = req.query.bye === '1';
   const reset = req.query.reset === '1';
   res.send(
@@ -316,6 +358,30 @@ app.post('/login', express.urlencoded({ extended: false }), csrfGuard, async (re
   req.session = rotateSession(req.session.id, { userId: user.id, state, mfaMethod: method });
   setSessionCookie(res, req.session.id);
   res.redirect(state === 'pending_2fa' ? '/2fa' : '/setup-2fa');
+});
+
+// 强制改密页（仅 change_password 状态可访问；完成后才真正认证放行）。
+app.get('/change-password', (req, res) => {
+  const s = req.session;
+  if (s.state !== 'change_password' || !s.user) return res.redirect('/');
+  res.send(pages.changePasswordPage({ csrf: s.csrf_token }));
+});
+
+app.post('/change-password', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
+  const s = req.session;
+  if (s.state !== 'change_password' || !s.user) return res.redirect('/');
+  const newPw = String(req.body.password || '');
+  const newPw2 = String(req.body.password2 || '');
+  if (newPw.length < 8 || newPw !== newPw2) {
+    return res.status(400).send(
+      pages.changePasswordPage({ csrf: s.csrf_token, error: '密码至少 8 位，且两次输入需一致。' })
+    );
+  }
+  const hash = await bcrypt.hash(newPw, config.bcryptRounds);
+  db.prepare('UPDATE users SET password_hash = ?, force_password_change = 0 WHERE id = ?').run(hash, s.user.id);
+  req.session = rotateSession(s.id, { userId: s.user.id, state: 'authed', mfaMethod: s.mfaMethod });
+  setSessionCookie(res, req.session.id);
+  res.redirect(ssoResumeOr(res, req, config.defaultRedirect));
 });
 
 // 第二步：二次验证（按会话记录的 mfa_method 渲染对应页面）
@@ -403,6 +469,12 @@ app.post('/2fa', express.urlencoded({ extended: false }), csrfGuard, (req, res) 
   const succeed = () => {
     clearLoginFails(ip, uname);
     db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso(), s.user.id);
+    // 管理员刚重置过密码 → 强制先改密再放行。
+    if (s.user.force_password_change) {
+      req.session = rotateSession(s.id, { userId: s.user.id, state: 'change_password', mfaMethod: method });
+      setSessionCookie(res, req.session.id);
+      return res.redirect('/change-password');
+    }
     req.session = rotateSession(s.id, { userId: s.user.id, state: 'authed', mfaMethod: method });
     setSessionCookie(res, req.session.id);
     res.redirect(ssoResumeOr(res, req, config.defaultRedirect));

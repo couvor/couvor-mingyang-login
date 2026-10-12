@@ -196,6 +196,10 @@ module.exports = {
 
   bcryptRounds: 12,
 
+  // 管理员重置密码端点（/admin/api/reset-password）的共享令牌。
+  // 由学桥运营后台经 127.0.0.1 直连调用；令牌仅存 /etc/loginapp.env，绝不进代码或日志。
+  adminApiToken: (process.env.ADMIN_API_TOKEN || '').trim(),
+
   // 头像（用户自行上传）：默认存腾讯云 COS，未配置桶时回退服务器本地文件。
   // 环境变量（/etc/loginapp.env，写入后 systemctl restart loginapp）：
   //   COS_BUCKET            桶名，形如 avatar-1250000000（**必须带 AppId 后缀**）
