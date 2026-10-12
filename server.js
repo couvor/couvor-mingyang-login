@@ -1255,16 +1255,21 @@ app.post('/sso/verify', express.json({ limit: '4kb' }), (req, res) => {
   const upd = db.prepare('UPDATE sso_tickets SET used = 1 WHERE ticket = ? AND used = 0').run(ticket);
   if (upd.changes !== 1) return deny();
 
-  const user = db.prepare('SELECT id, username, avatar_url FROM users WHERE id = ?').get(t.user_id);
+  const user = db.prepare('SELECT id, username, avatar_url, email, phone, email_verified, phone_verified FROM users WHERE id = ?').get(t.user_id);
   if (!user) return deny();
 
   clearLoginFails(ip, rateKey);
   // avatarUrl 为可直接访问的绝对地址（COS 或本站 /avatar/…），无头像时为 null
+  // email/phone：仅在对应渠道已验证时才可信，客户端（如学桥）应校验 *_verified 后再落库
   res.json({
     sub: String(user.id),
     username: user.username,
     displayName: user.username,
     avatarUrl: user.avatar_url || null,
+    email: user.email || null,
+    emailVerified: !!user.email_verified,
+    phone: user.phone || null,
+    phoneVerified: !!user.phone_verified,
   });
 });
 
