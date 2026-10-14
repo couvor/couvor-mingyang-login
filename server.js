@@ -18,6 +18,28 @@ const {
 } = require('./lib/ratelimit');
 const { verifyTurnstile } = require('./lib/turnstile');
 const { verifyRecaptcha } = require('./lib/recaptcha');
+
+// 人机验证失败的文案要分两种情况：
+//   missing-token —— 压根没收到令牌，几乎都是挂件（Turnstile / reCAPTCHA）没渲染出来，
+//     用户面前没有框可勾，此时说「未通过」是误导，应提示刷新重试；
+//   其他 —— 挂件在、但用户没通过或被判失败，才是真正意义上的人机验证未通过。
+// 前端已有加载守卫拦住未渲染就提交的情况，这里是兜底（脚本被拦 / JS 出错时仍可能命中）。
+function captchaError(res) {
+  const base = res && res.reason === 'missing-token'
+    ? '人机验证组件未加载完成，请刷新页面后重试。'
+    : '人机验证未通过，请重试。';
+  return base + (config.env === 'development' && res ? ` (${res.reason})` : '');
+}
+// 重定向回页面时携带的错误码：nocap = 挂件未加载，robot = 验证未通过。
+function captchaErrCode(res) {
+  return res && res.reason === 'missing-token' ? 'nocap' : 'robot';
+}
+function captchaQueryError(qErr) {
+  if (qErr === 'nocap') return '人机验证组件未加载完成，请刷新页面后重试。';
+  if (qErr === 'robot') return '人机验证未通过，请重试。';
+  return '';
+}
+
 const pages = require('./lib/pages');
 const multer = require('multer');
 const avatar = require('./lib/avatar');
@@ -333,7 +355,7 @@ app.post('/login', express.urlencoded({ extended: false }), csrfGuard, async (re
       pages.loginPage({
         csrf: req.session.csrf_token,
         username,
-        error: '人机验证未通过，请重试。' + (config.env === 'development' ? ` (${ts.reason})` : ''),
+        error: captchaError(ts),
       })
     );
   }
@@ -394,7 +416,7 @@ app.get('/2fa', async (req, res) => {
   if (s.state !== 'pending_2fa' || !s.user) return res.redirect('/');
   const method = s.mfa_method || userMfaMethod(s.user) || 'totp';
   const qErr = req.query.e;
-  const pageError = qErr === 'robot' ? '人机验证未通过，请重试。' : '';
+  const pageError = captchaQueryError(qErr);
 
   if (method === 'totp') {
     return res.send(
@@ -431,7 +453,7 @@ app.post('/2fa/send', express.urlencoded({ extended: false }), csrfGuard, async 
   const cap = await verifyRecaptcha(req.body['g-recaptcha-response'], ip);
   if (!cap.ok) {
     console.warn('[loginapp] /2fa/send reCAPTCHA 校验失败:', cap.reason, cap.codes || '');
-    return res.redirect('/2fa?e=robot');
+    return res.redirect(`/2fa?e=${captchaErrCode(cap)}`);
   }
 
   let notice = '';
@@ -563,7 +585,7 @@ app.post('/register', express.urlencoded({ extended: false }), csrfGuard, async 
 
   const ts = await verifyTurnstile(req.body['cf-turnstile-response'], ip, 'register');
   if (!ts.ok) {
-    return fail('人机验证未通过，请重试。' + (config.env === 'development' ? ` (${ts.reason})` : ''));
+    return fail(captchaError(ts));
   }
   if (!USERNAME_RE.test(username)) {
     return fail('用户名需为 3–24 位字母、数字或下划线。');
@@ -718,7 +740,7 @@ app.get('/setup-2fa/:method', async (req, res) => {
       target: mfaTarget(s.user, method),
       username: s.user.username,
       notice: hasCode ? `验证码已发送至 ${mfaTarget(s.user, method)}，10 分钟内有效。` : '',
-      error: req.query.e === '1' ? '验证码不正确，请重试。' : req.query.e === 'robot' ? '人机验证未通过，请重试。' : '',
+      error: req.query.e === '1' ? '验证码不正确，请重试。' : captchaQueryError(req.query.e),
       needSend: !hasCode,
     })
   );
@@ -738,7 +760,7 @@ app.post('/setup-2fa/:method/send', express.urlencoded({ extended: false }), csr
   const cap = await verifyRecaptcha(req.body['g-recaptcha-response'], ip);
   if (!cap.ok) {
     console.warn('[loginapp] /setup-2fa send reCAPTCHA 校验失败:', cap.reason, cap.codes || '');
-    return res.redirect(`/setup-2fa/${method}?e=robot`);
+    return res.redirect(`/setup-2fa/${method}?e=${captchaErrCode(cap)}`);
   }
 
   let notice = '';
@@ -960,7 +982,7 @@ app.post('/forgot-password', express.urlencoded({ extended: false }), csrfGuard,
       pages.forgotPasswordPage({
         csrf: s.csrf_token,
         account: ident,
-        error: '人机验证未通过，请重试。' + (config.env === 'development' ? ` (${ts.reason})` : ''),
+        error: captchaError(ts),
       })
     );
   }
@@ -996,7 +1018,7 @@ app.get('/forgot-password/code', (req, res) => {
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
   if (!user) return res.redirect('/forgot-password');
   const needSend = !mfa.hasValidResetCode(user.id);
-  const pageError = req.query.e === 'robot' ? '人机验证未通过，请重试。' : '';
+  const pageError = captchaQueryError(req.query.e);
   res.send(
     pages.forgotCodePage({
       csrf: s.csrf_token,
@@ -1020,7 +1042,7 @@ app.post('/forgot-password/send', express.urlencoded({ extended: false }), csrfG
   const cap = await verifyRecaptcha(req.body['g-recaptcha-response'], ip);
   if (!cap.ok) {
     console.warn('[loginapp] /forgot-password/send reCAPTCHA 校验失败:', cap.reason, cap.codes || '');
-    return res.redirect('/forgot-password/code?e=robot');
+    return res.redirect(`/forgot-password/code?e=${captchaErrCode(cap)}`);
   }
 
   let notice = '';
