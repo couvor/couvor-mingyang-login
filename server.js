@@ -25,19 +25,45 @@ const { verifyRecaptcha } = require('./lib/recaptcha');
 //   其他 —— 挂件在、但用户没通过或被判失败，才是真正意义上的人机验证未通过。
 // 前端已有加载守卫拦住未渲染就提交的情况，这里是兜底（脚本被拦 / JS 出错时仍可能命中）。
 function captchaError(res) {
-  const base = res && res.reason === 'missing-token'
-    ? '人机验证组件未加载完成，请刷新页面后重试。'
-    : '人机验证未通过，请重试。';
+  const codes = (res && res.codes) || [];
+  const reason = (res && res.reason) || '';
+  let base;
+  if (reason === 'missing-token') {
+    base = '人机验证组件未加载完成，请刷新页面后重试。';
+  } else if (codes.indexOf('timeout-or-duplicate') >= 0) {
+    // token 是一次性的、5 分钟过期：页面停留过久 / 后退复用旧 token / 重复提交都会命中这里。
+    base = '人机验证已失效（页面停留过久或重复提交），请刷新页面后重试。';
+  } else if (reason.indexOf('network') === 0 || reason.indexOf('http-') === 0) {
+    // 校验接口本身不可达，不是用户的问题——文案别误导成「你没通过」。
+    base = '人机验证服务暂时不可用，请稍后重试。';
+  } else {
+    base = '人机验证未通过，请重试。';
+  }
   return base + (config.env === 'development' && res ? ` (${res.reason})` : '');
 }
-// 重定向回页面时携带的错误码：nocap = 挂件未加载，robot = 验证未通过。
+// 重定向回页面时携带的错误码：nocap = 挂件未加载，expired = token 失效，down = 校验接口不可达，
+// robot = 验证未通过。
 function captchaErrCode(res) {
-  return res && res.reason === 'missing-token' ? 'nocap' : 'robot';
+  const codes = (res && res.codes) || [];
+  const reason = (res && res.reason) || '';
+  if (reason === 'missing-token') return 'nocap';
+  if (codes.indexOf('timeout-or-duplicate') >= 0) return 'expired';
+  if (reason.indexOf('network') === 0 || reason.indexOf('http-') === 0) return 'down';
+  return 'robot';
 }
 function captchaQueryError(qErr) {
   if (qErr === 'nocap') return '人机验证组件未加载完成，请刷新页面后重试。';
+  if (qErr === 'expired') return '人机验证已失效（页面停留过久或重复提交），请刷新页面后重试。';
+  if (qErr === 'down') return '人机验证服务暂时不可用，请稍后重试。';
   if (qErr === 'robot') return '人机验证未通过，请重试。';
   return '';
+}
+// 人机验证失败一律留痕：此前 Turnstile 失败没有任何日志，
+// 「挂件明明通过却被判未通过」只能靠猜（2026-10-18 事故排查教训）。绝不打印 token / secret。
+function logCaptchaFail(where, res) {
+  if (!res || res.ok) return;
+  const codes = res.codes ? ` codes=${JSON.stringify(res.codes)}` : '';
+  console.warn(`[loginapp] ${where} 人机验证失败: ${res.reason}${codes}`);
 }
 
 const pages = require('./lib/pages');
@@ -351,6 +377,7 @@ app.post('/login', express.urlencoded({ extended: false }), csrfGuard, async (re
 
   const ts = await verifyTurnstile(req.body['cf-turnstile-response'], ip, 'login');
   if (!ts.ok) {
+    logCaptchaFail('/login', ts);
     return res.status(400).send(
       pages.loginPage({
         csrf: req.session.csrf_token,
@@ -585,6 +612,7 @@ app.post('/register', express.urlencoded({ extended: false }), csrfGuard, async 
 
   const ts = await verifyTurnstile(req.body['cf-turnstile-response'], ip, 'register');
   if (!ts.ok) {
+    logCaptchaFail('/register', ts);
     return fail(captchaError(ts));
   }
   if (!USERNAME_RE.test(username)) {
@@ -978,6 +1006,7 @@ app.post('/forgot-password', express.urlencoded({ extended: false }), csrfGuard,
 
   const ts = await verifyTurnstile(req.body['cf-turnstile-response'], ip, 'forgot');
   if (!ts.ok) {
+    logCaptchaFail('/forgot-password', ts);
     return res.status(400).send(
       pages.forgotPasswordPage({
         csrf: s.csrf_token,
