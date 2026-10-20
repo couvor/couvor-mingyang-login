@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const QRCode = require('qrcode');
 
 const config = require('./config');
-const { db, nowIso, cleanupExpiredSessions } = require('./lib/db');
+const { db, ready, nowIso, cleanupExpiredSessions } = require('./lib/db');
 const {
   createSession, getSession, rotateSession, destroySession,
   setSessionCookie, clearSessionCookie,
@@ -71,6 +71,18 @@ const multer = require('multer');
 const avatar = require('./lib/avatar');
 
 const app = express();
+
+// Express 4 不会捕获 async 处理器的 reject —— 未捕获的 Promise 拒绝会让请求一直悬挂
+// （数据库抖动时会表现为「点了没反应」）。这里只给路由方法套一层：同步抛错行为不变，
+// 异步 reject 统一交给末尾的错误处理中间件。错误中间件（4 个参数）不套。
+const wrapAsync = (fn) =>
+  typeof fn === 'function' && fn.length < 4
+    ? (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
+    : fn;
+for (const m of ['get', 'post', 'put', 'patch', 'delete']) {
+  const orig = app[m].bind(app);
+  app[m] = (...args) => orig(...args.map(wrapAsync));
+}
 
 // 头像图片的来源域名（COS 默认域名或自定义 CDN 域名），用于放宽 CSP 的 img-src。
 // 只在真正使用 COS 存储时才放开；本地回退模式图片由本站 /avatar/… 提供，无需额外放行。
@@ -193,15 +205,20 @@ function ssoResumeOr(res, req, fallback) {
 }
 
 // ---------- 会话装载 ----------
-app.use((req, res, next) => {
-  const cookies = parseCookies(req);
-  let session = getSession(cookies[config.session.cookieName]);
-  if (!session) {
-    session = createSession(req);
-    setSessionCookie(res, session.id);
+// 数据库为 MySQL（异步），中间件需 await；异常交给统一错误处理，避免请求悬挂。
+app.use(async (req, res, next) => {
+  try {
+    const cookies = parseCookies(req);
+    let session = await getSession(cookies[config.session.cookieName]);
+    if (!session) {
+      session = await createSession(req);
+      setSessionCookie(res, session.id);
+    }
+    req.session = session;
+    next();
+  } catch (err) {
+    next(err);
   }
-  req.session = session;
-  next();
 });
 
 // CSRF 校验（所有 POST）
@@ -286,12 +303,12 @@ function mfaTarget(user, method) {
 // （原 ensureCode「进页面自动发码」已移除：发码必须先过 reCAPTCHA，见 POST /2fa/send。）
 
 // 绑定成功：写入启用的方式 → 置为已认证 → 续接 SSO 或回默认落地页。
-function completeMfaSetup(req, res, user, method) {
-  db.prepare('UPDATE users SET mfa_method = ? WHERE id = ?').run(method, user.id);
-  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso(), user.id);
+async function completeMfaSetup(req, res, user, method) {
+  await db.prepare('UPDATE users SET mfa_method = ? WHERE id = ?').run(method, user.id);
+  await db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso(), user.id);
   // 管理员刚重置过密码 → 强制先改密再放行（force_password_change 由重置端点置位）。
   if (user.force_password_change) {
-    req.session = rotateSession(req.session.id, {
+    req.session = await rotateSession(req.session.id, {
       userId: user.id,
       state: 'change_password',
       mfaMethod: method,
@@ -299,7 +316,7 @@ function completeMfaSetup(req, res, user, method) {
     setSessionCookie(res, req.session.id);
     return res.redirect('/change-password');
   }
-  req.session = rotateSession(req.session.id, {
+  req.session = await rotateSession(req.session.id, {
     userId: user.id,
     state: 'authed',
     mfaMethod: method,
@@ -330,16 +347,18 @@ app.post('/admin/api/reset-password', express.json(), async (req, res) => {
   if (!Number.isInteger(uid) || newPassword.length < 10) {
     return res.status(400).json({ ok: false, error: 'bad request' });
   }
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
   if (!user) return res.status(404).json({ ok: false, error: 'user not found' });
 
   const hash = await bcrypt.hash(newPassword, config.bcryptRounds);
-  db.prepare(
-    `UPDATE users SET password_hash = ?, totp_enabled = 0, mfa_method = NULL,
+  await db
+    .prepare(
+      `UPDATE users SET password_hash = ?, totp_enabled = 0, mfa_method = NULL,
        totp_secret = NULL, recovery_codes = NULL, force_password_change = 1 WHERE id = ?`
-  ).run(hash, uid);
+    )
+    .run(hash, uid);
   // 踢掉该用户所有在线会话，强制用新密码重新登录并完成 2FA 重设。
-  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(uid);
+  await db.prepare('DELETE FROM sessions WHERE user_id = ?').run(uid);
   console.log(`[loginapp] admin reset password for user ${uid} (forced 2FA re-setup + password change)`);
   return res.json({ ok: true });
 });
@@ -370,7 +389,7 @@ app.post('/login', express.urlencoded({ extended: false }), csrfGuard, async (re
   const ip = req.ip || '';
   const ipUsername = String(username || '').trim().toLowerCase();
 
-  const lock = loginLocked(ip, ipUsername);
+  const lock = await loginLocked(ip, ipUsername);
   if (lock.locked) {
     return res.redirect('/?locked=1');
   }
@@ -387,13 +406,13 @@ app.post('/login', express.urlencoded({ extended: false }), csrfGuard, async (re
     );
   }
 
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(ipUsername);
+  const user = await db.prepare('SELECT * FROM users WHERE username = ?').get(ipUsername);
   const hash = user ? user.password_hash : DUMMY_HASH;
   const match = await bcrypt.compare(String(password), hash);
 
   if (!user || !match) {
-    recordLoginFail(ip, ipUsername);
-    const after = loginLocked(ip, ipUsername);
+    await recordLoginFail(ip, ipUsername);
+    const after = await loginLocked(ip, ipUsername);
     return res.status(401).send(
       pages.loginPage({
         csrf: req.session.csrf_token,
@@ -405,10 +424,10 @@ app.post('/login', express.urlencoded({ extended: false }), csrfGuard, async (re
     );
   }
 
-  clearLoginFails(ip, ipUsername);
+  await clearLoginFails(ip, ipUsername);
   const method = userMfaMethod(user);
   const state = method ? 'pending_2fa' : 'setup_2fa';
-  req.session = rotateSession(req.session.id, { userId: user.id, state, mfaMethod: method });
+  req.session = await rotateSession(req.session.id, { userId: user.id, state, mfaMethod: method });
   setSessionCookie(res, req.session.id);
   res.redirect(state === 'pending_2fa' ? '/2fa' : '/setup-2fa');
 });
@@ -431,8 +450,10 @@ app.post('/change-password', express.urlencoded({ extended: false }), csrfGuard,
     );
   }
   const hash = await bcrypt.hash(newPw, config.bcryptRounds);
-  db.prepare('UPDATE users SET password_hash = ?, force_password_change = 0 WHERE id = ?').run(hash, s.user.id);
-  req.session = rotateSession(s.id, { userId: s.user.id, state: 'authed', mfaMethod: s.mfaMethod });
+  await db
+    .prepare('UPDATE users SET password_hash = ?, force_password_change = 0 WHERE id = ?')
+    .run(hash, s.user.id);
+  req.session = await rotateSession(s.id, { userId: s.user.id, state: 'authed', mfaMethod: s.mfaMethod });
   setSessionCookie(res, req.session.id);
   res.redirect(ssoResumeOr(res, req, config.defaultRedirect));
 });
@@ -453,7 +474,7 @@ app.get('/2fa', async (req, res) => {
 
   // 邮箱/手机：不再自动发码——必须先通过 Google reCAPTCHA（POST /2fa/send）才会真正发送。
   // 已有未过期验证码（刚发过或刷新页面）时直接显示输入框。
-  const hasCode = mfa.hasValidCode(method, s.user.id);
+  const hasCode = await mfa.hasValidCode(method, s.user.id);
   res.send(
     pages.twofaPage({
       csrf: s.csrf_token,
@@ -505,7 +526,7 @@ app.post('/2fa/send', express.urlencoded({ extended: false }), csrfGuard, async 
   );
 });
 
-app.post('/2fa', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
+app.post('/2fa', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
   const s = req.session;
   // 重复提交（网络抖动引发浏览器重试）：已认证则直接续接去应用，不在站内打转
   if (s.state === 'authed' && s.user_id) {
@@ -516,19 +537,19 @@ app.post('/2fa', express.urlencoded({ extended: false }), csrfGuard, (req, res) 
   const uname = s.user.username;
   const method = s.mfa_method || userMfaMethod(s.user) || 'totp';
 
-  const lock = loginLocked(ip, uname);
+  const lock = await loginLocked(ip, uname);
   if (lock.locked) return res.redirect('/?locked=1');
 
-  const succeed = () => {
-    clearLoginFails(ip, uname);
-    db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso(), s.user.id);
+  const succeed = async () => {
+    await clearLoginFails(ip, uname);
+    await db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso(), s.user.id);
     // 管理员刚重置过密码 → 强制先改密再放行。
     if (s.user.force_password_change) {
-      req.session = rotateSession(s.id, { userId: s.user.id, state: 'change_password', mfaMethod: method });
+      req.session = await rotateSession(s.id, { userId: s.user.id, state: 'change_password', mfaMethod: method });
       setSessionCookie(res, req.session.id);
       return res.redirect('/change-password');
     }
-    req.session = rotateSession(s.id, { userId: s.user.id, state: 'authed', mfaMethod: method });
+    req.session = await rotateSession(s.id, { userId: s.user.id, state: 'authed', mfaMethod: method });
     setSessionCookie(res, req.session.id);
     res.redirect(ssoResumeOr(res, req, config.defaultRedirect));
   };
@@ -541,7 +562,7 @@ app.post('/2fa', express.urlencoded({ extended: false }), csrfGuard, (req, res) 
       ok = true;
     } else {
       // TOTP 未通过 → 尝试一次性恢复码（存的是 SHA-256 哈希）
-      const fresh = db.prepare('SELECT * FROM users WHERE id = ?').get(s.user.id);
+      const fresh = await db.prepare('SELECT * FROM users WHERE id = ?').get(s.user.id);
       let codes = [];
       try {
         codes = JSON.parse(fresh.recovery_codes || '[]');
@@ -549,27 +570,26 @@ app.post('/2fa', express.urlencoded({ extended: false }), csrfGuard, (req, res) 
       const idx = Array.isArray(codes) ? codes.indexOf(hashRecovery(input)) : -1;
       if (idx !== -1) {
         codes.splice(idx, 1); // 用掉即作废
-        db.prepare('UPDATE users SET recovery_codes = ? WHERE id = ?').run(
-          JSON.stringify(codes),
-          fresh.id
-        );
+        await db
+          .prepare('UPDATE users SET recovery_codes = ? WHERE id = ?')
+          .run(JSON.stringify(codes), fresh.id);
         ok = true;
       }
     }
   } else {
     const input = String(req.body.code || '').trim();
-    if (mfa.verifyCode(method, s.user.id, input)) {
-      mfa.consumeCode(method, s.user.id);
+    if (await mfa.verifyCode(method, s.user.id, input)) {
+      await mfa.consumeCode(method, s.user.id);
       ok = true;
     }
   }
 
-  if (ok) return succeed();
+  if (ok) return await succeed();
 
-  recordLoginFail(ip, uname);
-  const after = loginLocked(ip, uname);
+  await recordLoginFail(ip, uname);
+  const after = await loginLocked(ip, uname);
   if (after.locked) {
-    destroySession(s.id);
+    await destroySession(s.id);
     clearSessionCookie(res);
     return res.redirect('/?locked=1');
   }
@@ -606,7 +626,7 @@ app.post('/register', express.urlencoded({ extended: false }), csrfGuard, async 
       pages.registerPage({ csrf: req.session.csrf_token, username, email, phone, error: msg })
     );
 
-  if (!registerAllowed(ip)) {
+  if (!(await registerAllowed(ip))) {
     return fail('该 IP 注册过于频繁，请一小时后再试。', 429);
   }
 
@@ -631,29 +651,29 @@ app.post('/register', express.urlencoded({ extended: false }), csrfGuard, async 
     return fail('两次输入的密码不一致。');
   }
 
-  const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
+  const exists = await db.prepare('SELECT id FROM users WHERE username = ?').get(username);
   if (exists) {
     return fail('该用户名已被使用，换一个试试。');
   }
-  const emailExists = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  const emailExists = await db.prepare('SELECT id FROM users WHERE email = ?').get(email);
   if (emailExists) {
     return fail('该邮箱已被注册，换一个试试。');
   }
-  const phoneExists = db.prepare('SELECT id FROM users WHERE phone = ?').get(phone);
+  const phoneExists = await db.prepare('SELECT id FROM users WHERE phone = ?').get(phone);
   if (phoneExists) {
     return fail('该手机号码已被注册，换一个试试。');
   }
 
   const hash = await bcrypt.hash(password, config.bcryptRounds);
-  const result = db
+  const result = await db
     .prepare('INSERT INTO users (username, password_hash, email, phone, created_at) VALUES (?, ?, ?, ?, ?)')
     .run(username, hash, email, phone, nowIso());
   const userId = Number(result.lastInsertRowid);
 
-  recordRegister(ip);
+  await recordRegister(ip);
   // 注册即激活：不再强制邮箱验证，直接进入二次验证绑定（TOTP / 邮箱 / 手机 三选一）。
   // 邮箱归属只在用户主动选择「邮箱验证」作为二次验证方式时才被证实（绑定成功置 email_verified=1）。
-  req.session = rotateSession(req.session.id, {
+  req.session = await rotateSession(req.session.id, {
     userId,
     state: 'setup_2fa',
   });
@@ -688,11 +708,9 @@ app.get('/setup-2fa/totp', async (req, res) => {
   if (!secret) {
     secret = generateSecret();
     const codes = generateRecoveryCodes();
-    db.prepare('UPDATE users SET totp_secret = ?, recovery_codes = ? WHERE id = ?').run(
-      secret,
-      JSON.stringify(codes),
-      s.user.id
-    );
+    await db
+      .prepare('UPDATE users SET totp_secret = ?, recovery_codes = ? WHERE id = ?')
+      .run(secret, JSON.stringify(codes), s.user.id);
     s.user.totp_secret = secret;
     s.user.recovery_codes = JSON.stringify(codes);
   }
@@ -705,10 +723,9 @@ app.get('/setup-2fa/totp', async (req, res) => {
   }
   if (!Array.isArray(codes) || codes.length === 0) {
     codes = generateRecoveryCodes();
-    db.prepare('UPDATE users SET recovery_codes = ? WHERE id = ?').run(
-      JSON.stringify(codes),
-      s.user.id
-    );
+    await db
+      .prepare('UPDATE users SET recovery_codes = ? WHERE id = ?')
+      .run(JSON.stringify(codes), s.user.id);
   }
 
   const uri = otpauthUri(secret, s.user.username, '明旸信息');
@@ -726,7 +743,7 @@ app.get('/setup-2fa/totp', async (req, res) => {
   );
 });
 
-app.post('/setup-2fa/totp', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
+app.post('/setup-2fa/totp', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
   const s = req.session;
   if (!s.user || !['setup_2fa', 'authed'].includes(s.state)) return res.redirect('/');
   if (userMfaMethod(s.user)) return res.redirect('/dashboard');
@@ -741,13 +758,12 @@ app.post('/setup-2fa/totp', express.urlencoded({ extended: false }), csrfGuard, 
     plain = JSON.parse(s.user.recovery_codes || '[]');
   } catch {}
   const hashed = (Array.isArray(plain) ? plain : []).map(hashRecovery);
-  db.prepare('UPDATE users SET totp_enabled = 1, recovery_codes = ? WHERE id = ?').run(
-    JSON.stringify(hashed),
-    s.user.id
-  );
+  await db
+    .prepare('UPDATE users SET totp_enabled = 1, recovery_codes = ? WHERE id = ?')
+    .run(JSON.stringify(hashed), s.user.id);
 
   // 有待续 SSO 请求则续接回客户端；否则回默认落地页（默认直接续接学桥 SSO）
-  completeMfaSetup(req, res, s.user, 'totp');
+  await completeMfaSetup(req, res, s.user, 'totp');
 });
 
 // 二次验证绑定 · 邮箱 / 手机（发送 + 校验一次性验证码）
@@ -760,7 +776,7 @@ app.get('/setup-2fa/:method', async (req, res) => {
   if (!methodEnabled(method)) return res.redirect('/setup-2fa?e=1');
 
   // 不再自动发码——必须先通过 Google reCAPTCHA（POST /setup-2fa/:method/send）才会真正发送。
-  const hasCode = mfa.hasValidCode(method, s.user.id);
+  const hasCode = await mfa.hasValidCode(method, s.user.id);
   res.send(
     pages.setupCodePage({
       csrf: s.csrf_token,
@@ -813,7 +829,7 @@ app.post('/setup-2fa/:method/send', express.urlencoded({ extended: false }), csr
   );
 });
 
-app.post('/setup-2fa/:method', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
+app.post('/setup-2fa/:method', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
   const method = req.params.method;
   if (method !== 'email' && method !== 'phone') return res.redirect('/setup-2fa');
   const s = req.session;
@@ -822,12 +838,12 @@ app.post('/setup-2fa/:method', express.urlencoded({ extended: false }), csrfGuar
   if (!methodEnabled(method)) return res.redirect('/setup-2fa?e=1');
 
   const input = String(req.body.code || '').trim();
-  if (!mfa.verifyCode(method, s.user.id, input)) {
+  if (!(await mfa.verifyCode(method, s.user.id, input))) {
     return res.redirect(`/setup-2fa/${method}?e=1`);
   }
-  mfa.consumeCode(method, s.user.id);
-  db.prepare(`UPDATE users SET ${method}_verified = 1 WHERE id = ?`).run(s.user.id);
-  completeMfaSetup(req, res, s.user, method);
+  await mfa.consumeCode(method, s.user.id);
+  await db.prepare(`UPDATE users SET ${method}_verified = 1 WHERE id = ?`).run(s.user.id);
+  await completeMfaSetup(req, res, s.user, method);
 });
 
 // 本服务不设独立控制台：认证完成后一律续接回应用（默认落地），
@@ -874,9 +890,9 @@ function fmtDateTime(iso) {
   return `${d.getFullYear()}.${pad2(d.getMonth() + 1)}.${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
-function accountView(req, res, { notice = '', error = '' } = {}) {
+async function accountView(req, res, { notice = '', error = '' } = {}) {
   const s = req.session;
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(s.user_id);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(s.user_id);
   if (!user) return res.redirect('/');
   const method = userMfaMethod(user);
   const mfaLabel =
@@ -904,11 +920,11 @@ function accountView(req, res, { notice = '', error = '' } = {}) {
   );
 }
 
-app.get('/account', requireAuthed, (req, res) => {
+app.get('/account', requireAuthed, async (req, res) => {
   const ok = String(req.query.ok || '');
   const code = String(req.query.e || '');
   const notice = ok === '1' ? '头像已更新，已同步到接入的应用。' : ok === 'removed' ? '已移除头像。' : '';
-  accountView(req, res, { notice, error: AVATAR_ERRORS[code] || '' });
+  await accountView(req, res, { notice, error: AVATAR_ERRORS[code] || '' });
 });
 
 app.post(
@@ -920,10 +936,10 @@ app.post(
     const userId = req.session.user_id;
     try {
       const saved = await avatar.saveAvatar(userId, req.file && req.file.buffer);
-      const prev = db.prepare('SELECT avatar_key FROM users WHERE id = ?').get(userId);
-      db.prepare(
-        'UPDATE users SET avatar_url = ?, avatar_key = ?, avatar_updated_at = ? WHERE id = ?'
-      ).run(saved.url, saved.key, nowIso(), userId);
+      const prev = await db.prepare('SELECT avatar_key FROM users WHERE id = ?').get(userId);
+      await db
+        .prepare('UPDATE users SET avatar_url = ?, avatar_key = ?, avatar_updated_at = ? WHERE id = ?')
+        .run(saved.url, saved.key, nowIso(), userId);
       // 先写新后删旧：清理失败不影响用户已换好的头像
       avatar.removeAfterReplace(prev && prev.avatar_key);
       res.redirect('/account?ok=1');
@@ -935,10 +951,11 @@ app.post(
   }
 );
 
-app.post('/account/avatar/delete', requireAuthed, csrfGuard, (req, res) => {
+app.post('/account/avatar/delete', requireAuthed, csrfGuard, async (req, res) => {
   const userId = req.session.user_id;
-  const row = db.prepare('SELECT avatar_key FROM users WHERE id = ?').get(userId);
-  db.prepare('UPDATE users SET avatar_url = NULL, avatar_key = NULL, avatar_updated_at = ? WHERE id = ?')
+  const row = await db.prepare('SELECT avatar_key FROM users WHERE id = ?').get(userId);
+  await db
+    .prepare('UPDATE users SET avatar_url = NULL, avatar_key = NULL, avatar_updated_at = ? WHERE id = ?')
     .run(nowIso(), userId);
   avatar.removeAfterReplace(row && row.avatar_key);
   res.redirect('/account?ok=removed');
@@ -967,13 +984,13 @@ function safeLogoutNext(raw) {
   return null;
 }
 
-app.post('/logout', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
-  destroySession(req.session.id);
+app.post('/logout', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
+  await destroySession(req.session.id);
   clearSessionCookie(res);
   res.redirect('/?bye=1');
 });
-app.get('/logout', (req, res) => {
-  destroySession(req.session.id);
+app.get('/logout', async (req, res) => {
+  await destroySession(req.session.id);
   clearSessionCookie(res);
   // SSO 客户端退出联动：清掉本站会话后回跳客户端（白名单校验）
   const next = safeLogoutNext(String(req.query.next || ''));
@@ -1017,7 +1034,7 @@ app.post('/forgot-password', express.urlencoded({ extended: false }), csrfGuard,
   }
 
   // 防账号枚举：无论账号是否存在，统一提示「已发送（若存在）」。
-  const user = db.prepare('SELECT * FROM users WHERE username = ? OR email = ?').get(ident, ident);
+  const user = await db.prepare('SELECT * FROM users WHERE username = ? OR email = ?').get(ident, ident);
   if (!user || !user.email) {
     return res.send(
       pages.messagePage({
@@ -1032,21 +1049,21 @@ app.post('/forgot-password', express.urlencoded({ extended: false }), csrfGuard,
 
   // 进入待校验态，记录归属用户；发码延迟到用户点「发送验证码」（先过 reCAPTCHA，
   // 避免无谓消耗邮件资源，与注册验证邮件「先验证、后发码」的范式一致）。
-  req.session = rotateSession(s.id, { state: 'reset_code' });
-  db.prepare('UPDATE sessions SET reset_user_id = ? WHERE id = ?').run(user.id, req.session.id);
+  req.session = await rotateSession(s.id, { state: 'reset_code' });
+  await db.prepare('UPDATE sessions SET reset_user_id = ? WHERE id = ?').run(user.id, req.session.id);
   setSessionCookie(res, req.session.id);
   res.redirect('/forgot-password/code');
 });
 
 // 第二步：输入验证码
-app.get('/forgot-password/code', (req, res) => {
+app.get('/forgot-password/code', async (req, res) => {
   const s = req.session;
   if (s.state === 'authed') return res.redirect('/dashboard');
   const uid = resetUserId(req);
   if (s.state !== 'reset_code' || !uid) return res.redirect('/forgot-password');
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
   if (!user) return res.redirect('/forgot-password');
-  const needSend = !mfa.hasValidResetCode(user.id);
+  const needSend = !(await mfa.hasValidResetCode(user.id));
   const pageError = captchaQueryError(req.query.e);
   res.send(
     pages.forgotCodePage({
@@ -1064,7 +1081,7 @@ app.post('/forgot-password/send', express.urlencoded({ extended: false }), csrfG
   const s = req.session;
   const uid = resetUserId(req);
   if (s.state !== 'reset_code' || !uid) return res.redirect('/forgot-password');
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
   if (!user) return res.redirect('/forgot-password');
 
   const ip = req.ip || '';
@@ -1095,15 +1112,15 @@ app.post('/forgot-password/send', express.urlencoded({ extended: false }), csrfG
   );
 });
 
-app.post('/forgot-password/code', express.urlencoded({ extended: false }), csrfGuard, (req, res) => {
+app.post('/forgot-password/code', express.urlencoded({ extended: false }), csrfGuard, async (req, res) => {
   const s = req.session;
   const uid = resetUserId(req);
   if (s.state !== 'reset_code' || !uid) return res.redirect('/forgot-password');
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
   if (!user) return res.redirect('/forgot-password');
 
   const input = String(req.body.code || '').trim();
-  if (!mfa.verifyResetCode(user.id, input)) {
+  if (!(await mfa.verifyResetCode(user.id, input))) {
     return res.status(400).send(
       pages.forgotCodePage({
         csrf: s.csrf_token,
@@ -1114,10 +1131,10 @@ app.post('/forgot-password/code', express.urlencoded({ extended: false }), csrfG
     );
   }
 
-  mfa.consumeResetCode(user.id);
+  await mfa.consumeResetCode(user.id);
   // 通过校验：进入「待设新密码」态，并记录归属用户。
-  req.session = rotateSession(s.id, { state: 'reset_set' });
-  db.prepare('UPDATE sessions SET reset_user_id = ? WHERE id = ?').run(uid, req.session.id);
+  req.session = await rotateSession(s.id, { state: 'reset_set' });
+  await db.prepare('UPDATE sessions SET reset_user_id = ? WHERE id = ?').run(uid, req.session.id);
   setSessionCookie(res, req.session.id);
   res.redirect('/forgot-password/reset');
 });
@@ -1135,7 +1152,7 @@ app.post('/forgot-password/reset', express.urlencoded({ extended: false }), csrf
   const s = req.session;
   const uid = resetUserId(req);
   if (s.state !== 'reset_set' || !uid) return res.redirect('/forgot-password');
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
+  const user = await db.prepare('SELECT * FROM users WHERE id = ?').get(uid);
   if (!user) return res.redirect('/forgot-password');
 
   const password = String(req.body.password || '');
@@ -1152,13 +1169,12 @@ app.post('/forgot-password/reset', express.urlencoded({ extended: false }), csrf
   }
 
   const hash = await bcrypt.hash(password, config.bcryptRounds);
-  db.prepare('UPDATE users SET password_hash = ?, reset_code_hash = NULL, reset_code_expires = NULL WHERE id = ?').run(
-    hash,
-    uid
-  );
+  await db
+    .prepare('UPDATE users SET password_hash = ?, reset_code_hash = NULL, reset_code_expires = NULL WHERE id = ?')
+    .run(hash, uid);
   // 安全：重置成功后使该用户所有已登录会话失效，强制重新登录。
-  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(uid);
-  destroySession(s.id);
+  await db.prepare('DELETE FROM sessions WHERE user_id = ?').run(uid);
+  await destroySession(s.id);
   clearSessionCookie(res);
   res.redirect('/?reset=1');
 });
@@ -1166,12 +1182,12 @@ app.post('/forgot-password/reset', express.urlencoded({ extended: false }), csrf
 // ---------- SSO：作为 IdP 为学桥等客户端提供登录 ----------
 
 // 引导入口：校验 client 与回调白名单；未登录先走本站登录（密码 + TOTP），已登录签发一次性票据
-app.get('/sso/authorize', (req, res) => {
+app.get('/sso/authorize', async (req, res) => {
   const clientId = String(req.query.client_id || '');
   const redirectUri = String(req.query.redirect_uri || '');
   const state = String(req.query.state || '').slice(0, 200);
 
-  const client = db.prepare('SELECT * FROM sso_clients WHERE client_id = ?').get(clientId);
+  const client = await db.prepare('SELECT * FROM sso_clients WHERE client_id = ?').get(clientId);
   const allowed = client
     ? client.redirect_uris.split(',').map((s) => s.trim()).filter(Boolean)
     : [];
@@ -1199,9 +1215,11 @@ app.get('/sso/authorize', (req, res) => {
   // 签发 60 秒一次性票据并回跳客户端
   const ticket = crypto.randomBytes(32).toString('hex');
   const expires = new Date(Date.now() + 60 * 1000).toISOString();
-  db.prepare(
-    'INSERT INTO sso_tickets (ticket, client_id, user_id, redirect_uri, expires_at, used) VALUES (?, ?, ?, ?, ?, 0)'
-  ).run(ticket, clientId, s.user_id, redirectUri, expires);
+  await db
+    .prepare(
+      'INSERT INTO sso_tickets (ticket, client_id, user_id, redirect_uri, expires_at, used) VALUES (?, ?, ?, ?, ?, 0)'
+    )
+    .run(ticket, clientId, s.user_id, redirectUri, expires);
 
   const u = new URL(redirectUri);
   u.searchParams.set('ticket', ticket);
@@ -1210,7 +1228,7 @@ app.get('/sso/authorize', (req, res) => {
 });
 
 // 服务端换身份（客户端 → 本服务，不经浏览器；失败一律 401 不区分原因）
-app.post('/sso/verify', express.json({ limit: '4kb' }), (req, res) => {
+app.post('/sso/verify', express.json({ limit: '4kb' }), async (req, res) => {
   const ip = req.ip || '';
   const body = req.body || {};
   const clientId = String(body.client_id || '');
@@ -1218,15 +1236,15 @@ app.post('/sso/verify', express.json({ limit: '4kb' }), (req, res) => {
   const ticket = String(body.ticket || '');
 
   const rateKey = `sso:${clientId}`;
-  if (loginLocked(ip, rateKey).locked) {
+  if ((await loginLocked(ip, rateKey)).locked) {
     return res.status(429).json({ error: 'rate-limited' });
   }
-  const deny = () => {
-    recordLoginFail(ip, rateKey);
+  const deny = async () => {
+    await recordLoginFail(ip, rateKey);
     return res.status(401).json({ error: 'invalid' });
   };
 
-  const client = db.prepare('SELECT * FROM sso_clients WHERE client_id = ?').get(clientId);
+  const client = await db.prepare('SELECT * FROM sso_clients WHERE client_id = ?').get(clientId);
   if (!client) return deny();
 
   const given = crypto.createHash('sha256').update(secret).digest('hex');
@@ -1236,16 +1254,18 @@ app.post('/sso/verify', express.json({ limit: '4kb' }), (req, res) => {
     crypto.timingSafeEqual(Buffer.from(given), Buffer.from(stored));
   if (!secretOk) return deny();
 
-  const t = db.prepare('SELECT * FROM sso_tickets WHERE ticket = ?').get(ticket);
+  const t = await db.prepare('SELECT * FROM sso_tickets WHERE ticket = ?').get(ticket);
   if (!t || t.client_id !== clientId || t.used || t.expires_at < nowIso()) return deny();
 
-  const upd = db.prepare('UPDATE sso_tickets SET used = 1 WHERE ticket = ? AND used = 0').run(ticket);
+  const upd = await db.prepare('UPDATE sso_tickets SET used = 1 WHERE ticket = ? AND used = 0').run(ticket);
   if (upd.changes !== 1) return deny();
 
-  const user = db.prepare('SELECT id, username, avatar_url, email, phone, email_verified, phone_verified FROM users WHERE id = ?').get(t.user_id);
+  const user = await db
+    .prepare('SELECT id, username, avatar_url, email, phone, email_verified, phone_verified FROM users WHERE id = ?')
+    .get(t.user_id);
   if (!user) return deny();
 
-  clearLoginFails(ip, rateKey);
+  await clearLoginFails(ip, rateKey);
   // avatarUrl 为可直接访问的绝对地址（COS 或本站 /avatar/…），无头像时为 null
   // email/phone：仅在对应渠道已验证时才可信，客户端（如学桥）应校验 *_verified 后再落库
   res.json({
@@ -1291,20 +1311,32 @@ app.use((err, req, res, next) => {
   );
 });
 
-// 会话/限频窗口定期清理
-setInterval(cleanupExpiredSessions, 30 * 60 * 1000).unref();
-
-app.listen(config.port, '127.0.0.1', () => {
-  const ts = config.turnstile.live ? 'LIVE' : 'TEST';
-  console.log(`[loginapp] listening on 127.0.0.1:${config.port} (env=${config.env}, turnstile=${ts})`);
-  // 只打印后端类型与桶名，绝不打印密钥
-  console.log(
-    `[loginapp] avatar storage: ${config.avatar.backend}` +
-      (config.avatar.backend === 'cos'
-        ? ` (bucket=${config.avatar.bucket}, region=${config.avatar.region})`
-        : ` (dir=${config.avatar.localDir})`)
+// 会话/限频窗口定期清理（异步：失败只记日志，不能让进程崩）
+setInterval(() => {
+  cleanupExpiredSessions().catch((e) =>
+    console.error('[loginapp] 清理过期会话/限频失败:', e.message)
   );
-  if (!config.turnstile.live && process.env.TURNSTILE_SITE_KEY) {
-    console.warn('[loginapp] TURNSTILE_SITE_KEY 已配置但 secret 未填（占位符），已回退测试密钥。请编辑 /etc/loginapp.env 填入 TURNSTILE_SECRET_KEY。');
-  }
-});
+}, 30 * 60 * 1000).unref();
+
+// 先确认 MySQL 可连、表结构就绪，再开始监听；否则带着坏连接对外服务只会全站 500。
+ready
+  .then(() => {
+    app.listen(config.port, '127.0.0.1', () => {
+      const ts = config.turnstile.live ? 'LIVE' : 'TEST';
+      console.log(`[loginapp] listening on 127.0.0.1:${config.port} (env=${config.env}, turnstile=${ts}, db=mysql)`);
+      // 只打印后端类型与桶名，绝不打印密钥
+      console.log(
+        `[loginapp] avatar storage: ${config.avatar.backend}` +
+          (config.avatar.backend === 'cos'
+            ? ` (bucket=${config.avatar.bucket}, region=${config.avatar.region})`
+            : ` (dir=${config.avatar.localDir})`)
+      );
+      if (!config.turnstile.live && process.env.TURNSTILE_SITE_KEY) {
+        console.warn('[loginapp] TURNSTILE_SITE_KEY 已配置但 secret 未填（占位符），已回退测试密钥。请编辑 /etc/loginapp.env 填入 TURNSTILE_SECRET_KEY。');
+      }
+    });
+  })
+  .catch((err) => {
+    console.error('[loginapp] 启动失败（MySQL 不可用或表结构初始化失败）:', err.message);
+    process.exit(1);
+  });

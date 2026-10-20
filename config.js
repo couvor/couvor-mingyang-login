@@ -91,7 +91,20 @@ module.exports = {
   port: parseInt(process.env.PORT || '3000', 10),
   env: process.env.NODE_ENV || 'development',
 
-  // 数据库放项目目录外
+  // 数据库：MySQL（2026-10-20 由 SQLite 迁入）。
+  // 连接信息一律从 /etc/loginapp.env 读取，密码绝不进代码或日志。
+  //   DB_HOST 默认 127.0.0.1（MySQL 只监听回环，不对外）
+  //   DB_USER / DB_PASSWORD 由宝塔侧建的库账号提供
+  db: {
+    host: (process.env.DB_HOST || '127.0.0.1').trim(),
+    port: parseInt(process.env.DB_PORT || '3306', 10),
+    user: (process.env.DB_USER || 'loginapp').trim(),
+    password: process.env.DB_PASSWORD || '',
+    database: (process.env.DB_NAME || 'loginapp').trim(),
+    connectionLimit: parseInt(process.env.DB_POOL_SIZE || '10', 10),
+  },
+
+  // 旧的 SQLite 库路径：仅迁移/备份脚本使用，运行期已不再读写。
   dbPath: process.env.DB_PATH || '/var/lib/loginapp/app.db',
 
   baseUrl: process.env.BASE_URL || 'https://login.mingyanginfo.com',
