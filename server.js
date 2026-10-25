@@ -1261,7 +1261,7 @@ app.post('/sso/verify', express.json({ limit: '4kb' }), async (req, res) => {
   if (upd.changes !== 1) return deny();
 
   const user = await db
-    .prepare('SELECT id, username, avatar_url, email, phone, email_verified, phone_verified FROM users WHERE id = ?')
+    .prepare('SELECT id, username, nickname, avatar_url, email, phone, email_verified, phone_verified FROM users WHERE id = ?')
     .get(t.user_id);
   if (!user) return deny();
 
@@ -1271,7 +1271,8 @@ app.post('/sso/verify', express.json({ limit: '4kb' }), async (req, res) => {
   res.json({
     sub: String(user.id),
     username: user.username,
-    displayName: user.username,
+    nickname: user.nickname || null,
+    displayName: user.nickname || user.username,
     avatarUrl: user.avatar_url || null,
     email: user.email || null,
     emailVerified: !!user.email_verified,
